@@ -125,33 +125,27 @@ class SAM3_FSVOS:
         # Get dimensions
         crop_h, crop_w = cropped_support.shape[:2]
         query_h, query_w = result_img.shape[:2]
-        
-        # Check if resizing is needed (if cropped region is larger than query image)
-        scale = 1.0
-        if crop_h > query_h // 3 or crop_w > query_w // 3:
-            # Calculate scale factor to fit within query image
-            # scale_h = query_h / crop_h
-            # scale_w = query_w / crop_w
-            # scale = min(scale_h, scale_w)
-            
-            # Calculate new dimensions
-            # new_h = int(crop_h * scale)
-            # new_w = int(crop_w * scale)
-            if crop_h > query_h // 3:
-                scale = query_h // 3 / crop_h
-            if crop_w > query_w // 3:
-                scale = max(scale, query_w // 3 / crop_w)
-            new_h = int(crop_h * scale)
-            new_w = int(crop_w * scale)
+                
+        # Calculate scale based on desired width (1/3 of query_w)
+        target_max_width = query_w / 4
+        target_max_height = query_h / 2
 
-            # Resize the cropped support image
-            cropped_support = cv2.resize(cropped_support, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            
-            # Resize the mask (use INTER_NEAREST to preserve binary values)
-            cropped_mask = cv2.resize(cropped_mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST).astype(bool)
-            
-            # Update dimensions
-            crop_h, crop_w = new_h, new_w
+        scale_w = target_max_width / crop_w
+        scale_h = target_max_height / crop_h
+        
+        scale = min(scale_w, scale_h)
+
+        new_h = int(crop_h * scale)
+        new_w = int(crop_w * scale)
+
+        # Resize the cropped support image
+        cropped_support = cv2.resize(cropped_support, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        
+        # Resize the mask (use INTER_NEAREST to preserve binary values)
+        cropped_mask = cv2.resize(cropped_mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+        
+        # Update dimensions
+        crop_h, crop_w = new_h, new_w
         
         # Calculate paste position (bottom left corner)
         corner = random.choice(['top_left', 'top_right', 'bottom_left', 'bottom_right'])
