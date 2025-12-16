@@ -8,6 +8,8 @@ output/
 # C extensions
 *.so
 
+models/
+
 # Distribution / packaging
 .Python
 build/

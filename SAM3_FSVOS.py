@@ -7,11 +7,11 @@ import random
 from utils.Evaluator import Evaluator
 import time
 from datetime import datetime
-from YoutubeFSVOS import YTVOSDataset
+from datasets.YoutubeFSVOS.YoutubeFSVOS import YTVOSDataset
 from sam3.model_builder import build_sam3_video_model
 
 class SAM3_FSVOS:
-    def __init__(self, checkpoint, config, session_name, dataset_path, output_dir, verbose, test_query_frame_num):
+    def __init__(self, checkpoint, session_name, dataset_path, output_dir, verbose, test_query_frame_num):
         # self.args = args
         if checkpoint is None:
             print("No checkpoint path provided. Exiting")
@@ -200,8 +200,8 @@ class SAM3_FSVOS:
 
     @torch.inference_mode()
     @torch.autocast(device_type="cuda", dtype=torch.float32)
-    def process_video_sam2(self, video_predictor, support_set, video_query_set, class_id, dir_name, evaluator, device, data_dir="./output", crop_paste_support_to_query=False):
-
+    def process_video_sam2(self, support_set, video_query_set, class_id, dir_name, evaluator, device, data_dir="./output", crop_paste_support_to_query=False, class_name=None):
+        video_predictor = self.video_predictor
         print(f"Processing video: {dir_name}")
         base_dir = f"{data_dir}/{dir_name}"
 
@@ -376,9 +376,8 @@ class SAM3_FSVOS:
     def get_video_names(self):
         return os.listdir(self.dataset_path)
 
-    def test(self, group=1, seed=42, crop_paste_support_to_query=False):
+    def test(self, group=1, seed=42, crop_paste_support_to_query=False, nshot=5):
         device = self.device
-        video_predictor = self.video_predictor
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_directory = f"{self.output_dir}/{self.session_name}/fold_{group}_{timestamp}"
@@ -387,7 +386,7 @@ class SAM3_FSVOS:
         
         os.makedirs(output_directory, exist_ok=True)
 
-        test_dataset = YTVOSDataset(train=False, set_index=group, data_dir=self.dataset_path, test_query_frame_num=self.test_query_frame_num, seed=seed)
+        test_dataset = YTVOSDataset(train=False, set_index=group, data_dir=self.dataset_path, test_query_frame_num=self.test_query_frame_num, seed=seed, support_frame=nshot)
         test_list = test_dataset.get_class_ids()
 
         print('test_group:',group, '  test_num:', len(test_dataset), '  class_list:', test_list, ' dataset_path:', self.dataset_path)
@@ -397,13 +396,14 @@ class SAM3_FSVOS:
         for index, data in enumerate(test_dataset):
             
             video_query_img, video_query_mask, new_support_img, new_support_mask, class_id, dir_name, begin_new = data
+            class_name = test_dataset.idx_to_classname[class_id]
+
             if begin_new:
                 support_set = [(img, mask) for img, mask in zip(new_support_img, new_support_mask)]
-                print(f"Support set for class {class_id} initialized with {len(support_set)} images.")
+                print(f"Support set for class {class_id}, {class_name} -  initialized with {len(support_set)} images.")
 
             video_query_set = [(img, mask) for img, mask in zip(video_query_img, video_query_mask)]
             self.process_video_sam2(
-                video_predictor,
                 support_set,
                 video_query_set, 
                 class_id, 
@@ -445,7 +445,6 @@ class SAM3_FSVOS:
 
     def reprod_test(self, group=1):
         device = self.device
-        video_predictor = self.video_predictor
         n_support_frames = 1
 
         output_directory = f"{self.output_dir}/{self.session_name}"
@@ -473,7 +472,6 @@ class SAM3_FSVOS:
             class_id = data["class_id"]
             
             self.process_video_sam2(
-                video_predictor,
                 support_set,
                 video_query_set, 
                 class_id, 
