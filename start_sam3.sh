@@ -31,11 +31,19 @@ else
     run_dir="FULL_TEST_1"
 fi
 
+if [ -n "$5" ]; then
+    N_SHOT=$5
+else
+    N_SHOT=5
+fi
+
 srun python test_SAM3_FSVOS.py \
+    --benchmark youtube-fsvos \
     --checkpoint /leonardo_work/IscrC_MARSv2/SAM3_FSVOS/src/checkpoints/sam3.pt \
     --group ${2} \
     --dataset_path /leonardo_work/IscrC_MARSv2/datasets/Youtube-FSVOS/train \
     --output_dir /leonardo_scratch/large/userexternal/mcavicch/SAM3_OUTPUT_DATA/${1}/${run_dir} \
     --session_name fold_${2} \
     --seed ${3} \
-    --nshot 1
+    --nshot ${N_SHOT} \
+    --crop_paste_support_to_query

@@ -7,13 +7,14 @@ from SAM3_FSVOS_TEXT import SAM3_FSVOS_TEXT
 def get_arguments():
         parser = argparse.ArgumentParser(description='FSVOS')
         parser.add_argument("--checkpoint", type=str, default=None)
+        parser.add_argument("--benchmark", type=str, default="youtube-fsvos", choices=["youtube-fsvos", "minivspw"])
         parser.add_argument("--session_name", type=str, default=str(random.randbytes(4).hex()))
         parser.add_argument("--dataset_path", type=str, default=None)
+        parser.add_argument("--data_list_path", type=str, default=None)
         parser.add_argument("--output_dir", type=str, default="./output")
         parser.add_argument("--group", type=int, default=1)
         parser.add_argument("--test_query_frame_num", type=int, default=None)
         parser.add_argument("--verbose", action="store_true")
-        parser.add_argument("--seed", type=int, default=42)
         parser.add_argument("--crop_paste_support_to_query", action="store_true")
         # text_prompt -> prompt SAM3 with text
         parser.add_argument("--text_prompt", action="store_true")
@@ -36,6 +37,10 @@ def get_arguments():
         parser.add_argument('--alpha_blending', type=float, default=0.5)
         parser.add_argument('--thickness', type=int, default=2)
 
+        # Random state management
+        parser.add_argument('--seed', type=int, default=0)
+        parser.add_argument('--run_number', type=int, default=1)
+        parser.add_argument('--random_state_path', type=str, default=None)
 
 
         return parser.parse_args()
@@ -79,8 +84,9 @@ def main():
             output_dir=args.output_dir,
             verbose=args.verbose,
             test_query_frame_num=args.test_query_frame_num,
+            args=args
         )
-        mean_f, mean_j, score_dict = sam3_predictor.test(group=args.group, seed=args.seed, crop_paste_support_to_query=args.crop_paste_support_to_query, nshot=args.nshot)
+        mean_f, mean_j, score_dict = sam3_predictor.test(fold=args.group, seed=args.seed, crop_paste_support_to_query=args.crop_paste_support_to_query, nshot=args.nshot)
     else:
         print("Using SAM3_FSVOS_TEXT")
 
@@ -95,7 +101,7 @@ def main():
             test_query_frame_num=args.test_query_frame_num,
             args=args
         )
-        mean_f, mean_j, score_dict = sam3_predictor_text.test(group=args.group, seed=args.seed, nshot=args.nshot)
+        mean_f, mean_j, score_dict = sam3_predictor_text.test(fold=args.group, seed=args.seed, nshot=args.nshot)
 
     print(f"Group {args.group} - Mean F: {mean_f}, Mean J: {mean_j}")
     print(f"Detailed Scores: {json.dumps(score_dict, indent=4)}")

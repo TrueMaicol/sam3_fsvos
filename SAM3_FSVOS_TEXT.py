@@ -10,10 +10,10 @@ from datetime import datetime
 from datasets.YoutubeFSVOS.YoutubeFSVOS import YTVOSDataset
 from datasets.YoutubeFSVOS.transform import TestTransform
 from sam3.model_builder import build_sam3_video_predictor
-from scipy.ndimage import label, center_of_mass
 
 from VLM_label_gen import LabelGenerator
-
+from datasets.MiniVSPW.nminivspw_dataset import NMiniVSPWEpisodicData
+from RandomStateManager import RandomStateManager
 
 def fix_randseed(seed):
     r""" Set random seeds for reproducibility """
@@ -32,10 +32,6 @@ class SAM3_FSVOS_TEXT:
             print("No checkpoint path provided. Exiting")
             return
 
-        random.seed(args.seed)
-        fix_randseed(args.seed)
-
-
         self.args = args
         self.checkpoint = checkpoint
         self.session_name = session_name
@@ -43,6 +39,11 @@ class SAM3_FSVOS_TEXT:
         self.output_dir = output_dir
         self.verbose = verbose
         self.test_query_frame_num = test_query_frame_num     
+        self.benchmark = args.benchmark
+        # MiniVSPW data
+        self.data_list_path = args.data_list_path
+        self.random_state_path = args.random_state_path
+        self.run_number = args.run_number
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
@@ -104,6 +105,11 @@ class SAM3_FSVOS_TEXT:
 
     def get_bounding_box(self, mask):
         # get the bounding box of the object normalized to the frame size (x,y,w,h)
+        # Ensure mask is 2D (squeeze out channel dimensions if present)
+        if mask.ndim > 2:
+            mask = mask.squeeze()
+        if mask.ndim > 2:  # If still 3D, take first channel
+            mask = mask[:, :, 0]
         h, w = mask.shape[:2]
         y, x = np.where(mask)
         x_min, x_max = np.min(x), np.max(x)
@@ -287,10 +293,15 @@ class SAM3_FSVOS_TEXT:
                 self.save_mask_overlay(img, mask, os.path.join(ground_truth_dir, f"support_{i:05d}.png"))
 
         if use_support_visuals:
+            # THIS IS TO COPY THE SUPPORT OBJECT TO A BLANK FRAME AND RETURN THE BOUNDING BOX OF THE SUPPORT OBJECT
             query_img, _ = video_query_set[0]
             result_img, support_bounding_box = self.copy_paste_support_to_query(support_set, query_img)
             self.save_image(result_img, os.path.join(frames_dir, f"{0:05d}.jpg"))
             self.save_bbox_overlay(result_img, support_bounding_box, os.path.join(ground_truth_dir, f"support_bbox.jpg"))
+
+            # THIS IS TO USE THE NATIVE FRAME FROM THE SUPPORT SET AND RETURN THE BOUNDING BOX OF THE SUPPORT OBJECT
+            # support_bounding_box = self.create_support_frame(support_set, frames_dir)
+            # self.save_bbox_overlay(support_set[0][0], support_bounding_box, os.path.join(ground_truth_dir, f"support_bbox.jpg"))
 
         for i, (img, _) in enumerate(video_query_set):
             idx = i + 1 if use_support_visuals else i
@@ -335,7 +346,8 @@ class SAM3_FSVOS_TEXT:
                 type="add_prompt",
                 session_id=session_id,
                 frame_index=0,
-                text=class_name,
+                text=class_name, # Commented this to use the semantic prompt without text and only image exemplar
+                # text=None,
                 bounding_boxes=[support_bounding_box] if use_support_visuals else None,
                 bounding_box_labels=[1] if use_support_visuals else None,
             ))
@@ -373,16 +385,18 @@ class SAM3_FSVOS_TEXT:
             query_frame_idx = i + 1 if use_support_visuals else i  # Frames saved are 0-indexed
             
             # Extract merged mask for current query frame
+            self.save_mask_overlay(query_frame, query_mask, f"{ground_truth_dir}/query_{i:04d}.png")
             if query_frame_idx in video_segments and video_segments[query_frame_idx] is not None:
                 mask = video_segments[query_frame_idx]
                 segmented_masks.append(mask)
                 # Save visualization
                 self.save_mask_overlay(query_frame, mask, f"{prediction_dir}/out_{i:04d}.png")
-                self.save_mask_overlay(query_frame, query_mask, f"{ground_truth_dir}/query_{i:04d}.png")
+                self.save_image(mask.astype(np.uint8)*255, f"{prediction_dir}/out_mask_{i:04d}.png")
             else:
                 # No mask found, append empty mask
                 empty_mask = np.zeros((query_frame.shape[0], query_frame.shape[1]), dtype=bool)
                 segmented_masks.append(empty_mask)
+                self.save_image(empty_mask.astype(np.uint8)*255, f"{prediction_dir}/out_mask_{i:04d}.png")
                 print(f"  WARNING: No mask found for query frame {i} (frame_idx {query_frame_idx})")
                
         print(f"Segmentation complete! Generated {len(segmented_masks)} masks")
@@ -461,21 +475,40 @@ class SAM3_FSVOS_TEXT:
     def get_video_names(self):
         return os.listdir(self.dataset_path)
 
-    def test(self, group=1, seed=42, nshot=5):
+    def test(self, fold=1, seed=42, nshot=5):
 
         device = self.device
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_directory = f"{self.output_dir}/{self.session_name}/fold_{group}_{timestamp}"
+        output_directory = f"{self.output_dir}/{self.session_name}/fold_{fold}_{timestamp}"
         if self.output_dir is None:
-            output_directory = f"./output/{self.session_name}/fold_{group}_{timestamp}"
+            output_directory = f"./output/{self.session_name}/fold_{fold}_{timestamp}"
         
         os.makedirs(output_directory, exist_ok=True)
 
-        test_dataset = YTVOSDataset(train=False, set_index=group, data_dir=self.dataset_path, test_query_frame_num=self.test_query_frame_num, seed=seed, support_frame=nshot, transforms=TestTransform(size=518) if self.args.gen_labels and self.args.nshot > 0 else None)
-        test_list = test_dataset.get_class_ids()
+        if self.benchmark == "youtube-fsvos":
+            test_dataset = YTVOSDataset(train=False, set_index=fold, data_dir=self.dataset_path, test_query_frame_num=self.test_query_frame_num, seed=seed, support_frame=nshot, transforms=TestTransform(size=518))
+            random.seed(seed)
+            fix_randseed(seed)
+        elif self.benchmark == "minivspw":
+            test_dataset = NMiniVSPWEpisodicData(
+                fold=fold-1,
+                sprtset_as_frames=False,
+                split_type='test',
+                shot=nshot,
+                data_root=self.dataset_path,
+                data_list_path=self.data_list_path,
+                transform=TestTransform(size=518) ,
+            )
+            state_manager = RandomStateManager(save_dir=self.random_state_path)
 
-        print('test_group:',group, '  test_num:', len(test_dataset), '  class_list:', test_list, ' dataset_path:', self.dataset_path)
+            if self.run_number == 1:
+                state_manager.initialize_seed(seed=seed)
+            else:
+                state_manager.load_state(fold=fold, run_number=self.run_number-1)
+        test_list = test_dataset.get_class_ids() 
+
+        print('test_group:',fold, '  test_num:', len(test_dataset), '  class_list:', test_list, ' dataset_path:', self.dataset_path)
         test_evaluations = Evaluator(class_list=test_list, verbose=self.verbose)
         support_set = []
         start_time = time.perf_counter()
@@ -484,13 +517,22 @@ class SAM3_FSVOS_TEXT:
             label_generator = LabelGenerator(self.args)
 
         for index, data in enumerate(test_dataset):
-            
-            video_query_img, video_query_mask, new_support_img, new_support_mask, class_id, dir_name, begin_new = data
 
-            if begin_new:
+            if self.benchmark == "youtube-fsvos":
+                video_query_img, video_query_mask, new_support_img, new_support_mask, class_id, dir_name, begin_new = data
+
+                if begin_new:
+                    support_set = [(img, mask) for img, mask in zip(new_support_img, new_support_mask)]
+                    class_name = test_dataset.idx_to_classname[class_id]
+                    
+            elif self.benchmark == "minivspw":
+                video_query_img, video_query_mask, new_support_img, new_support_mask, class_id, dir_name, _ = data
                 support_set = [(img, mask) for img, mask in zip(new_support_img, new_support_mask)]
+                class_id = class_id[0]
                 class_name = test_dataset.idx_to_classname[class_id]
-                if self.args.gen_labels:
+
+            if self.args.gen_labels:
+                if (self.benchmark == "youtube-fsvos" and begin_new) or (self.benchmark == "minivspw"):
                     # new_support_img is a list of numpy arrays in (H, W, C) format
                     # new_support_mask is a list of numpy arrays in (H, W, 1) format
                     # Stack them and convert to tensors with proper format for VLM:
@@ -506,11 +548,13 @@ class SAM3_FSVOS_TEXT:
                         support_masks,
                         self.args,
                         use_descriptions=False,
-                        save_dir=os.path.join(output_directory, f"class_{class_id}_support_visuals")
+                        # save_dir=os.path.join(output_directory, f"class_{class_id}_support_visuals")
+                        save_dir=None
                         )
                     print("VLM Predicted class: ", class_name)
-                print(f"Support set for class {class_id}, {class_name} -  initialized with {len(support_set)} images.")
+            print(f"Support set for class {class_id}, {class_name} -  initialized with {len(support_set)} images.")          
 
+            dir_name = f"{dir_name}_{class_id}_{index}"
             video_query_set = [(img, mask) for img, mask in zip(video_query_img, video_query_mask)]
             self.process_video_sam2(
                 support_set,
@@ -550,6 +594,9 @@ class SAM3_FSVOS_TEXT:
 
         # Save evaluation results
         self.save_evaluation_results(output_directory, mean_f, mean_j, score_dict, elapsed_minutes)
+        
+        # if self.benchmark == 'minivspw':
+        #     state_manager.save_state(fold=fold, run_number=self.run_number)
 
         return mean_f, mean_j, score_dict
     

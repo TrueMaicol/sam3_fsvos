@@ -204,7 +204,7 @@ class YTVOSDataset(Dataset):
 
         if self.transforms is not None:
             query_frames, query_masks = self.transforms(query_frames, query_masks)
-            if begin_new:
+            if begin_new and support_frames:
                 if self.another_transform is not None:
                     support_frames, support_masks = self.another_transform(support_frames, support_masks)
                 else:

@@ -1,4 +1,3 @@
-import argparse
 from typing import List
 import json
 import os
@@ -7,7 +6,6 @@ import numpy as np
 from tqdm import tqdm
 import cv2
 import torch
-import random
 
 from .static_dataset import StandardData, EpisodicData
 
@@ -106,7 +104,6 @@ class NMiniVSPWEpisodicData(EpisodicData):
         data_list_path: str = None,
         transform = None,
         class_list = None,
-        seed = None,
         args = None,
         **kwargs
     ):
@@ -116,7 +113,6 @@ class NMiniVSPWEpisodicData(EpisodicData):
             self.fold = args.train_split
             self.sprtset_as_frames = args.sprtset_as_frames
             self.split_type = args.split_type
-            self.seed = args.seed
             _shot = args.shot
             _random_shot = getattr(args, 'random_shot', False)
             _data_root = args.data_root
@@ -126,7 +122,6 @@ class NMiniVSPWEpisodicData(EpisodicData):
             self.fold = fold
             self.sprtset_as_frames = sprtset_as_frames
             self.split_type = split_type
-            self.seed = seed
             _shot = shot
             _random_shot = kwargs.get('random_shot', False)
             _data_root = data_root
@@ -275,42 +270,34 @@ class NMiniVSPWEpisodicData(EpisodicData):
         """
         seq_name = self.data_list[index]
         classes = self.classes_per_seq[seq_name]
-        print(f"Setting random seed to {self.seed + index}")
-        random.seed(self.seed + index)
-
         chosen_class = np.random.choice(classes)
         qry_frames, qry_masks = self._load_seq(seq_name, chosen_class)
         if self.transform is not None:
             qry_frames, qry_masks = self.transform(qry_frames, qry_masks)
-        qry_masks = qry_masks[:, 0].float()
-
+        
+        # qry_frames is a list of [H, W, C] numpy arrays
+        # qry_masks is a list of [H, W, 1] numpy arrays - squeeze to [H, W]
+        qry_masks = [m.squeeze() for m in qry_masks]
         support_frames, support_masks = [], []
         selected_seqs = list(self.seqs_per_cls[chosen_class].keys())
         selected_seqs.remove(seq_name)
-
         for shot in range(self.shot):
-            print(f"Setting random seed to {self.seed + chosen_class + shot}")
-            print(f"type of chosen_class {type(chosen_class)}")
-            random.seed(int(self.seed + chosen_class + shot))
             sprt_seq = np.random.choice(selected_seqs)
             sprt_frames, sprt_masks = self._load_seq(sprt_seq, chosen_class,
-                                                     self.seqs_per_cls[chosen_class][sprt_seq])
+                                                    self.seqs_per_cls[chosen_class][sprt_seq])
             if self.transform is not None:
                 sprt_frames, sprt_masks = self.transform(sprt_frames, sprt_masks)
+            
             if not self.sprtset_as_frames:
-                print(f"Setting random seed to {self.seed + chosen_class + shot}")
-                random.seed(int(self.seed + chosen_class + shot))
-                rnd_idx = np.random.randint(0, sprt_frames.shape[0])
-                sprt_frames = sprt_frames[rnd_idx]
-                sprt_masks = sprt_masks[rnd_idx]
-
+                # Pick a random single frame from the support sequence
+                rnd_idx = np.random.randint(0, len(sprt_frames))
+                sprt_frames = sprt_frames[rnd_idx]  # [H, W, C]
+                sprt_masks = sprt_masks[rnd_idx].squeeze()  # [H, W]
             support_frames.append(sprt_frames)
-            support_masks.append(sprt_masks.float())
+            support_masks.append(sprt_masks)
         subcls_list = [chosen_class]
-
-        if not self.sprtset_as_frames:
-            support_frames = torch.stack(support_frames)
-            support_masks = torch.stack(support_masks)
-            support_masks = support_masks[:, 0]
-
+        # Return lists of numpy arrays (same format as YouTube-FSVOS)
         return qry_frames, qry_masks, support_frames, support_masks, subcls_list, seq_name, []
+        
+    def get_class_ids(self):
+        return self.class_ids

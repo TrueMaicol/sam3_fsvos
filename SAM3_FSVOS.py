@@ -8,10 +8,25 @@ from utils.Evaluator import Evaluator
 import time
 from datetime import datetime
 from datasets.YoutubeFSVOS.YoutubeFSVOS import YTVOSDataset
+from datasets.YoutubeFSVOS.transform import TestTransform
 from sam3.model_builder import build_sam3_video_model
+from datasets.MiniVSPW.nminivspw_dataset import NMiniVSPWEpisodicData
+from RandomStateManager import RandomStateManager
+
+
+def fix_randseed(seed):
+    r""" Set random seeds for reproducibility """
+    if seed is None:
+        seed = int(random.random() * 1e5)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 class SAM3_FSVOS:
-    def __init__(self, checkpoint, session_name, dataset_path, output_dir, verbose, test_query_frame_num):
+    def __init__(self, checkpoint, session_name, dataset_path, output_dir, verbose, test_query_frame_num, args):
         # self.args = args
         if checkpoint is None:
             print("No checkpoint path provided. Exiting")
@@ -23,7 +38,11 @@ class SAM3_FSVOS:
         self.output_dir = output_dir
         self.verbose = verbose
         self.test_query_frame_num = test_query_frame_num     
-
+        self.benchmark = args.benchmark
+        self.run_number = args.run_number
+        self.random_state_path = args.random_state_path
+        self.data_list_path = args.data_list_path 
+        
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
         # self.video_predictor = build_sam2_video_predictor(self.model_cfg, self.checkpoint, device=self.device, apply_postprocessing=False)
@@ -48,6 +67,13 @@ class SAM3_FSVOS:
         # Ensure image is numpy array
         if isinstance(image, Image.Image):
             image = np.array(image)
+        
+        if image.dtype in (np.float32, np.float64):
+            # Assume values are in [0, 1] range if max <= 1, otherwise [0, 255]
+            if image.max() <= 1.0:
+                image = (image * 255).astype(np.uint8)
+            else:
+                image = image.astype(np.uint8)
     
         # print(f"Image shape: {image.shape[:2]}, Mask shape: {mask.shape[:2]}")
         
@@ -74,6 +100,13 @@ class SAM3_FSVOS:
     def save_image(self, image, path):
         """Save a numpy array or PIL image to the specified path."""
         if isinstance(image, np.ndarray):
+            # Convert float arrays to uint8 (PIL doesn't support float32 RGB)
+            if image.dtype in (np.float32, np.float64):
+                # Assume values are in [0, 1] range if max <= 1, otherwise [0, 255]
+                if image.max() <= 1.0:
+                    image = (image * 255).astype(np.uint8)
+                else:
+                    image = image.astype(np.uint8)
             image = Image.fromarray(image)
         image.save(path)
 
@@ -184,6 +217,7 @@ class SAM3_FSVOS:
         os.makedirs(output_dir, exist_ok=True)
         os.makedirs(ground_truth_dir, exist_ok=True)
 
+        # if crop_paste_support_to_query is not set then use native frames
         if not crop_paste_support_to_query:
             for i, (img, _) in enumerate(support_set):
                 self.save_image(img, os.path.join(frames_dir, f"{i:04d}.jpg"))
@@ -256,6 +290,7 @@ class SAM3_FSVOS:
         # Add support frame masks to the predictor
         for i, (img, mask) in enumerate(support_set):
             mask_tensor = torch.tensor(mask > 0, dtype=torch.bool, device=device)
+            mask_tensor = mask_tensor.squeeze()
             # print(f"Support frame {i}: mask tensor shape {mask_tensor.shape}, dtype {mask_tensor.dtype}, device {mask_tensor.device}")
             video_predictor.add_new_mask(
                 inference_state=inference_state,
@@ -286,13 +321,13 @@ class SAM3_FSVOS:
             query_frame_idx = len(support_set) + i
             
             # Extract mask for current query frame
+            self.save_mask_overlay(query_frame, query_mask, f"{ground_truth_dir}/query_{i:04d}.png")
             if query_frame_idx in video_segments and obj_id in video_segments[query_frame_idx]:
                 mask = video_segments[query_frame_idx][obj_id]
                 segmented_masks.append(mask)
                 # print(f"  Found mask with {np.sum(mask)} non-zero elements")
                 # Save visualization
                 self.save_mask_overlay(query_frame, mask, f"{prediction_dir}/out_{i:04d}.png")
-                self.save_mask_overlay(query_frame, query_mask, f"{ground_truth_dir}/query_{i:04d}.png")
                 # print(f"  Successfully processed query frame {i}")
             else:
                 # No mask found, append empty mask
@@ -376,31 +411,58 @@ class SAM3_FSVOS:
     def get_video_names(self):
         return os.listdir(self.dataset_path)
 
-    def test(self, group=1, seed=42, crop_paste_support_to_query=False, nshot=5):
+    def test(self, fold=1, seed=42, crop_paste_support_to_query=False, nshot=5):
         device = self.device
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_directory = f"{self.output_dir}/{self.session_name}/fold_{group}_{timestamp}"
+        output_directory = f"{self.output_dir}/{self.session_name}/fold_{fold}_{timestamp}"
         if self.output_dir is None:
-            output_directory = f"./output/{self.session_name}/fold_{group}_{timestamp}"
+            output_directory = f"./output/{self.session_name}/fold_{fold}_{timestamp}"
         
         os.makedirs(output_directory, exist_ok=True)
 
-        test_dataset = YTVOSDataset(train=False, set_index=group, data_dir=self.dataset_path, test_query_frame_num=self.test_query_frame_num, seed=seed, support_frame=nshot)
-        test_list = test_dataset.get_class_ids()
+        if self.benchmark == "youtube-fsvos":
+            test_dataset = YTVOSDataset(train=False, set_index=fold, data_dir=self.dataset_path, test_query_frame_num=self.test_query_frame_num, seed=seed, support_frame=nshot, transforms=TestTransform(size=518))
+            random.seed(seed)
+            fix_randseed(seed)
+        elif self.benchmark == "minivspw":
+            test_dataset = NMiniVSPWEpisodicData(
+                fold=fold-1,
+                sprtset_as_frames=False,
+                split_type='test',
+                shot=nshot,
+                data_root=self.dataset_path,
+                data_list_path=self.data_list_path,
+                transform=TestTransform(size=518),
+            )
+            state_manager = RandomStateManager(save_dir=self.random_state_path)
 
-        print('test_group:',group, '  test_num:', len(test_dataset), '  class_list:', test_list, ' dataset_path:', self.dataset_path)
+            if self.run_number == 1:
+                state_manager.initialize_seed(seed=seed)
+            else:
+                state_manager.load_state(fold=fold, run_number=self.run_number-1)
+        test_list = test_dataset.get_class_ids() 
+
+        print('test_group:',fold, '  test_num:', len(test_dataset), '  class_list:', test_list, ' dataset_path:', self.dataset_path)
         test_evaluations = Evaluator(class_list=test_list, verbose=self.verbose)
         support_set = []
         start_time = time.perf_counter()
         for index, data in enumerate(test_dataset):
             
-            video_query_img, video_query_mask, new_support_img, new_support_mask, class_id, dir_name, begin_new = data
-            class_name = test_dataset.idx_to_classname[class_id]
+            if self.benchmark == "youtube-fsvos":
+                video_query_img, video_query_mask, new_support_img, new_support_mask, class_id, dir_name, begin_new = data
 
-            if begin_new:
+                if begin_new:
+                    support_set = [(img, mask) for img, mask in zip(new_support_img, new_support_mask)]
+                    class_name = test_dataset.idx_to_classname[class_id]
+                    
+            elif self.benchmark == "minivspw":
+                video_query_img, video_query_mask, new_support_img, new_support_mask, class_id, dir_name, _ = data
                 support_set = [(img, mask) for img, mask in zip(new_support_img, new_support_mask)]
-                print(f"Support set for class {class_id}, {class_name} -  initialized with {len(support_set)} images.")
+                class_id = class_id[0]
+                class_name = test_dataset.idx_to_classname[class_id]
+
+            dir_name = f"{dir_name}_{class_id}_{index}"
 
             video_query_set = [(img, mask) for img, mask in zip(video_query_img, video_query_mask)]
             self.process_video_sam2(
