@@ -51,7 +51,6 @@ class RandomAffine(object):
 
     def __call__(self, imgs, annos):
 
-
         seq = iaa.Sequential([
             iaa.Crop(percent=(0.0, 0.1), keep_size=True),
             iaa.Affine(scale=(0.95, 1.05), shear=(-10, 10), rotate=(-15, 15))
@@ -251,8 +250,6 @@ class ReverseClip(object):
 
         return imgs[::-1], annos[::-1]
 
-
-
 class AddAxis(object):
 
     def __call__(self, imgs, annos):
@@ -308,7 +305,6 @@ class TrainTransform(object):
     def __call__(self, imgs, annos):
         return self.transform(imgs, annos)
 
-
 class TestTransform(object):
 
     def __init__(self, size):
@@ -318,8 +314,8 @@ class TestTransform(object):
             # Rescale(size),
             ResizeToSquare(size),
             # Normalize(),
-            # Stack(),
-            # ToTensor()
+            Stack(),
+            ToTensor(),
         ])
 
     def __call__(self, imgs, annos):

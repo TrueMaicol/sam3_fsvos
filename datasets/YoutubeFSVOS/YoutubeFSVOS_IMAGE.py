@@ -6,12 +6,14 @@ import random
 from PIL import Image
 from torchvision import transforms
 import json
+import pandas as pd
 
-class YTVOSDataset(Dataset):
+class YTVOSDataset_Image(Dataset):
     def __init__(self, data_dir=None, train=True, valid=False,
                  set_index=1, finetune_idx=None,
                  support_frame=5, query_frame=1, sample_per_class=10,
-                 transforms=None, another_transform=None, test_query_frame_num=None, seed=None):
+                 transforms=None, another_transform=None, frame_num=None, seed=None,
+                 use_synset_names=False, synset_mapping_csv_path=None):
         self.train = train
         self.valid = valid
         self.set_index = set_index
@@ -20,19 +22,28 @@ class YTVOSDataset(Dataset):
         self.sample_per_class = sample_per_class
         self.transforms = transforms
         self.another_transform = another_transform
-        self.test_query_frame_num = test_query_frame_num
-        self.benchmark = "youtube-fsvos-video"
+        if frame_num <= 0:
+            raise Exception("frame_num must be greater than 0")
+        self.frame_num = frame_num
+        self.benchmark = "youtube-fsvos"
         self.seed = seed
+        self.shortenend_videos = 0
+        self.use_synset_names = use_synset_names
 
         # Load class names from categories.json
         categories_path = os.path.join(os.path.dirname(__file__), 'categories.json')
         with open(categories_path, 'r') as f:
             categories = json.load(f)
         
-        self.idx_to_classname = {cat['id']: cat['name'] for cat in categories}
-
         if data_dir is None:
             data_dir = "./datasets/Youtube-FSVOS/train"
+        
+        if synset_mapping_csv_path is None:
+            self.synset_mapping_csv_path = os.path.join(data_dir, "synset_mapping.csv")
+        else:
+            self.synset_mapping_csv_path = synset_mapping_csv_path
+
+
         self.img_dir = os.path.join(data_dir, 'JPEGImages')
         self.ann_file = os.path.join(data_dir, 'instances.json')
 
@@ -48,15 +59,41 @@ class YTVOSDataset(Dataset):
         if finetune_idx is not None:
             self.class_ids = [self.class_ids[finetune_idx]]
 
+        self.class_idx_to_all_lemmas = {}
+        if self.use_synset_names:
+            synset_mapping = pd.read_csv(self.synset_mapping_csv_path, sep="|")
+            self.idx_to_classname = {}
+            for cat in categories:
+                idx = cat['id']
+                # don't use all the classes, just use the ones inside the validation list
+                if idx not in self.class_ids:
+                    continue
+                match = synset_mapping[synset_mapping['idx'] == idx]
+                selected_lemma = match['selected_lemma']
+                
+                if len(selected_lemma) > 0 and pd.notna(selected_lemma.values[0]):
+                    self.idx_to_classname[idx] = str(selected_lemma.values[0]).split(",")[0].replace("_", " ")
+                else:
+                    print("No match found for {}".format(idx))
+                    # Fallback to categories.json name
+
+                lemmas_str = match['lemmas'].values[0] if 'lemmas' in synset_mapping.columns else None
+                if lemmas_str is not None and pd.notna(lemmas_str):
+                    self.class_idx_to_all_lemmas[idx] = [l.replace("_", " ") for l in str(lemmas_str).split(",")]
+        else:
+            self.idx_to_classname = {cat['id']: cat['name'] for cat in categories}
+            
+        assert len(self.class_ids) == len(self.idx_to_classname.keys()), "The number of classes in the dataset does not match the number of classes in the label mapping."
+
         self.video_ids = []
         for class_id in self.class_ids:
             tmp_list = self.ytvos.getVidIds(catIds=class_id)
             tmp_list.sort()
-            self.video_ids.append(tmp_list)  # list[list[video_id]]
+            self.video_ids.append(tmp_list)  # list[list[video_id]] # video_ids is a list of length (num_classes) and each entry has a list of the video ids for that specific class
         if not self.train:
             self.test_video_classes = []
-            for i in range(len(self.class_ids)):
-                for j in range(len(self.video_ids[i]) - support_frame):  # remove the support set
+            for i in range(len(self.class_ids)): # for each class
+                for j in range(len(self.video_ids[i]) - support_frame):  # remove the support set and append the class idx for each video
                     self.test_video_classes.append(i)
 
         if self.train:
@@ -93,41 +130,14 @@ class YTVOSDataset(Dataset):
                 class_frame_id[class_id] = [i for i in range(frame_len) if class_id in frame_class[i]]
             vid_info['class_frames'] = class_frame_id
 
-    def get_GT_byclass(self, vid, class_id, frame_num=1, test=False):
+    def get_GT_byclass(self, vid, class_id, frame_num=None, test=False):
+        if frame_num is None:
+            raise Exception('frame_num must be specified')
         vid_info = self.vid_infos[vid]
         frame_list = vid_info['class_frames'][class_id]
-        frame_len = len(frame_list)
-        choice_frame = random.sample(frame_list, 1)
-        if test:
-            frame_num = frame_len
-            # override the number of query frames during testing
-            if self.test_query_frame_num is not None:
-                frame_num = self.test_query_frame_num
-        if frame_num > 1:
-            # if the requested number of frames is less than the available frames for this class
-            if frame_num <= frame_len:
-                # select a random starting frame
-                choice_idx = frame_list.index(choice_frame[0])
-                # if the starting frame is too close to the beginning of the video, just take the first 'frame_num' frames
-                if choice_idx < frame_num:
-                    begin_idx = 0
-                    end_idx = frame_num
-                else:
-                    # if there are enough frames before the starting frame, take 'frame_num' frames ending with the selected frame
-                    begin_idx = choice_idx - frame_num + 1
-                    end_idx = choice_idx + 1
-                choice_frame = [frame_list[n] for n in range(begin_idx, end_idx)]
-            else:
-                choice_frame = []
-                for i in range(frame_num):
-                    if i < frame_len:
-                        choice_frame.append(frame_list[i])
-                    else:
-                        choice_frame.append(frame_list[frame_len - 1])
-        frames = [np.array(Image.open(os.path.join(self.img_dir, vid_info['file_names'][frame_idx]))) for frame_idx in
-                  choice_frame]
-        masks = []
-        for frame_id in choice_frame:
+        
+        full_masks = {}
+        for frame_id in frame_list:
             object_ids = vid_info['objects'][frame_id]
             mask = None
             for object_id in object_ids:
@@ -145,9 +155,26 @@ class YTVOSDataset(Dataset):
 
             assert mask is not None
             mask[mask > 0] = 1
-            masks.append(mask)
+            if np.sum(mask) > 0:
+                full_masks[frame_id] = mask
+        
+        
+        available_frames = list(full_masks.keys())
+        print(available_frames)
+        if frame_num >= len(available_frames):
+            # raise Exception(f'Asking for {frame_num} frames but the video has {len(available_frames)} non-empty frames')
+            print(f"The video {vid_info['dir']} has {len(available_frames)} frame with class {class_id} present. Requested {frame_num} frames. Taking the entire video...")
+            chosen_frames = available_frames
+            self.shortenend_videos += 1
+        else:
+            chosen_frames = random.sample(available_frames, frame_num)
+        
+        print(f"Selected frames idx: {chosen_frames} from video {vid_info['dir']}")
 
-        return frames, masks
+        frames = [np.array(Image.open(os.path.join(self.img_dir, vid_info['file_names'][frame_idx]))) for frame_idx in chosen_frames]
+        masks=[full_masks[frame_idx] for frame_idx in chosen_frames]
+
+        return frames, masks, chosen_frames
 
     def __gettrainitem__(self, idx):
         list_id = idx // self.sample_per_class
@@ -177,8 +204,8 @@ class YTVOSDataset(Dataset):
         else:
             if self.test_video_classes[idx] != self.test_video_classes[idx - 1]:
                 begin_new = True
-        list_id = self.test_video_classes[idx]
-        vid_set = self.video_ids[list_id]
+        list_id = self.test_video_classes[idx] # get the class_idx specific for the requested video
+        vid_set = self.video_ids[list_id] # get the list of videos for the chosen class
         # print(f"Testing class {self.class_ids[list_id]} with {len(vid_set)} videos")
         support_frames, support_masks = [], []
         if begin_new:
@@ -193,14 +220,14 @@ class YTVOSDataset(Dataset):
             self.query_ids = query_vids
             self.query_idx = -1
             for i in range(self.support_frame):
-                one_frame, one_mask = self.get_GT_byclass(support_vid[i], self.class_ids[list_id], 1)
+                one_frame, one_mask, support_chosen_frames = self.get_GT_byclass(support_vid[i], self.class_ids[list_id], 1)
                 print("Support video ID: ", support_vid[i])
                 support_frames += one_frame
                 support_masks += one_mask
 
         self.query_idx += 1
         query_vid = self.query_ids[self.query_idx]
-        query_frames, query_masks = self.get_GT_byclass(query_vid, self.class_ids[list_id], test=True)
+        query_frames, query_masks, chosen_frames = self.get_GT_byclass(query_vid, self.class_ids[list_id], frame_num=self.frame_num, test=True)
 
         if self.transforms is not None:
             query_frames, query_masks = self.transforms(query_frames, query_masks)
@@ -211,7 +238,7 @@ class YTVOSDataset(Dataset):
                     support_frames, support_masks = self.transforms(support_frames, support_masks)
         vid_info = self.vid_infos[query_vid]
         vid_name = vid_info['dir']
-        return query_frames, query_masks, support_frames, support_masks, self.class_ids[list_id], vid_name, begin_new
+        return query_frames, query_masks, support_frames, support_masks, self.class_ids[list_id], vid_name, begin_new, chosen_frames
 
     def __getitem__(self, idx):
         if self.train:

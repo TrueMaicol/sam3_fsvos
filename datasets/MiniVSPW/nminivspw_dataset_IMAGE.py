@@ -1,11 +1,12 @@
+import cv2
 from typing import List
 import json
 import os
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
-import cv2
 import torch
+import pandas as pd
 
 from .static_dataset import StandardData, EpisodicData
 
@@ -77,7 +78,7 @@ class NMiniVSPWStandardData(StandardData):
         return img, mask, self.use_aux
 
 
-class NMiniVSPWEpisodicData(EpisodicData):
+class NMiniVSPWEpisodicData_IMAGE(EpisodicData):
     """
     Episodic data loader for MiniVSPW dataset.
     
@@ -93,6 +94,8 @@ class NMiniVSPWEpisodicData(EpisodicData):
         transform: Transform to apply to images/masks. Default: None
         class_list (list): List of classes. Default: None (will be loaded from file)
         args: Argparse namespace object (alternative to individual params). Default: None
+        n_frames (int): Number of frames to sub-sample from each video. Default: None (use all frames)
+        seed_offset (int): Seed offset for reproducible class selection across runs. Default: 42
     """
     def __init__(
         self,
@@ -105,6 +108,10 @@ class NMiniVSPWEpisodicData(EpisodicData):
         transform = None,
         class_list = None,
         args = None,
+        n_frames: int = None,  # Number of frames to sub-sample (None = all frames)
+        seed_offset: int = 42,  # Seed offset for reproducible class selection
+        use_synset_names: bool = False,
+        synset_mapping_csv_path = None,
         **kwargs
     ):
         # Support both individual parameters and args object
@@ -126,7 +133,12 @@ class NMiniVSPWEpisodicData(EpisodicData):
             _random_shot = kwargs.get('random_shot', False)
             _data_root = data_root
             _data_list_path = data_list_path
-        self.benchmark = 'minivspw-video'
+        self.benchmark = 'minivspw-image'
+        self.n_frames = n_frames
+        self.seed_offset = seed_offset
+        self.shortenend_videos = 0
+        self.use_synset_names = use_synset_names
+
         # Validate required parameters
         if _data_root is None:
             raise ValueError("data_root is required")
@@ -135,6 +147,28 @@ class NMiniVSPWEpisodicData(EpisodicData):
         
         class_dic = self.load_classes(self.fold, _data_list_path)
         self.idx_to_classname = class_dic
+        if synset_mapping_csv_path is None:
+            self.synset_mapping_csv_path = os.path.join(_data_root, "synset_mapping.csv")
+        else:
+            self.synset_mapping_csv_path = synset_mapping_csv_path
+
+        self.class_idx_to_all_lemmas = {}
+        if self.use_synset_names:
+            synset_mapping = pd.read_csv(self.synset_mapping_csv_path, sep="|")
+            for idx in list(self.idx_to_classname.keys()):
+                match = synset_mapping[synset_mapping['idx'] == idx]
+                selected_lemma = match['selected_lemma']
+                
+                if len(selected_lemma) > 0 and pd.notna(selected_lemma.values[0]):
+                    self.idx_to_classname[idx] = str(selected_lemma.values[0]).split(",")[0].replace("_", " ")
+                else:
+                    print("No match found for {}".format(idx))
+
+                lemmas_str = match['lemmas'].values[0] if 'lemmas' in synset_mapping.columns else None
+                if lemmas_str is not None and pd.notna(lemmas_str):
+                    self.class_idx_to_all_lemmas[idx] = [l.replace("_", " ") for l in str(lemmas_str).split(",")]
+                
+
         self.class_list_current = list(class_dic.keys())
         self.class_ids = self.class_list_current
         self.nclass = len(self.class_ids)
@@ -149,7 +183,7 @@ class NMiniVSPWEpisodicData(EpisodicData):
         params_proxy.random_shot = _random_shot
         params_proxy.data_root = _data_root
         
-        super(NMiniVSPWEpisodicData, self).__init__(
+        super(NMiniVSPWEpisodicData_IMAGE, self).__init__(
             transform=transform,
             class_list=class_list if class_list is not None else list(class_dic.keys()),
             data_list_path=_data_list_path,
@@ -249,9 +283,10 @@ class NMiniVSPWEpisodicData(EpisodicData):
             image = np.float32(image)
             imgs.append(image)
 
-            mask = cv2.imread(
-                    image_path.replace('origin', 'mask').replace('jpg', 'png'), 0
-                )
+            mask_path = image_path.replace('origin', 'mask').replace('jpg', 'png')
+            # Use PIL for mask loading - OpenCV has libpng issues on compute nodes
+            mask = np.array(Image.open(mask_path))
+            
             temp_mask = np.zeros_like(mask)
             temp_mask[mask == cls] = 1
             masks.append(temp_mask)
@@ -268,13 +303,42 @@ class NMiniVSPWEpisodicData(EpisodicData):
             support_masks: [shot x T x 1 x H x W]
             subcls_list: List[int] chosen classes
         """
+        # Use per-index RNG for reproducible class selection across runs
+        index_rng = np.random.RandomState(seed=index + self.seed_offset)
+        
         seq_name = self.data_list[index]
         classes = self.classes_per_seq[seq_name]
-        chosen_class = np.random.choice(classes)
+        
+        # Use per-index RNG to ensure same class is chosen for this index across runs
+        chosen_class = index_rng.choice(classes)
+        
+        # Load all frames
         qry_frames, qry_masks = self._load_seq(seq_name, chosen_class)
+        
+        # Sub-sample frames if n_frames is specified
+        # Only sample from frames where the chosen class is present
+        if self.n_frames is not None and self.n_frames < len(qry_frames):
+            # Find frames where chosen class is present (mask has non-zero values)
+            valid_frame_indices = []
+            for i, mask in enumerate(qry_masks):
+                if np.sum(mask > 0) > 0:  # Class is present in this frame
+                    valid_frame_indices.append(i)
+            # If we have enough valid frames, sub-sample; otherwise use all valid frames
+            if len(valid_frame_indices) >= self.n_frames:
+                print(f"Selected {len(valid_frame_indices)} frames for sequence {seq_name}")
+                # Randomly select n_frames from valid frames
+                selected_indices = np.random.choice(valid_frame_indices, self.n_frames, replace=False)
+            else:
+                self.shortenend_videos += 1
+                selected_indices = valid_frame_indices
+            print(f"Selected {len(selected_indices)} frames for sequence {seq_name}")
+            qry_frames = [qry_frames[i] for i in selected_indices]
+            qry_masks = [qry_masks[i] for i in selected_indices]
+        
         if self.transform is not None:
             qry_frames, qry_masks = self.transform(qry_frames, qry_masks)
-        
+        else:
+            print("No transform specified")
         # qry_frames is a list of [H, W, C] numpy arrays
         # qry_masks is a list of [H, W, 1] numpy arrays - squeeze to [H, W]
         qry_masks = [m.squeeze() for m in qry_masks]
@@ -297,7 +361,7 @@ class NMiniVSPWEpisodicData(EpisodicData):
             support_masks.append(sprt_masks)
         subcls_list = [chosen_class]
         # Return lists of numpy arrays (same format as YouTube-FSVOS)
-        return qry_frames, qry_masks, support_frames, support_masks, subcls_list, seq_name, []
+        return qry_frames, qry_masks, support_frames, support_masks, subcls_list, seq_name, selected_indices
         
     def get_class_ids(self):
         return self.class_ids
