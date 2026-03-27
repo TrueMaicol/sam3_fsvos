@@ -22,6 +22,8 @@ def get_arguments():
         parser.add_argument("--use_support_visuals", action="store_true")
         parser.add_argument("--nshot", type=int, default=5)
         parser.add_argument("--gen_labels", action="store_true")
+        parser.add_argument("--eval_present_frames_only", action="store_true", help="Only evaluate on frames where the object is present in the gt")
+
 
         # VLM PARAMS
         parser.add_argument('--vlm_model_path', type=str, default="./models", help='Path to the VLM model directory')

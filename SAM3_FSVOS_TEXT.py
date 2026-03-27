@@ -44,6 +44,7 @@ class SAM3_FSVOS_TEXT:
         self.data_list_path = args.data_list_path
         self.random_state_path = args.random_state_path
         self.run_number = args.run_number
+        self.eval_present_frames_only = args.eval_present_frames_only
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
@@ -274,7 +275,7 @@ class SAM3_FSVOS_TEXT:
         
         combined_bbox = self.get_bounding_box(combined_mask)
         
-        return result_img, combined_bbox
+        return result_img, combined_bboxf
 
 
     def create_dirs(self, base_dir, support_set, video_query_set, use_support_visuals=False, save_support_gt=False):
@@ -324,7 +325,7 @@ class SAM3_FSVOS_TEXT:
 
     @torch.inference_mode()
     @torch.autocast(device_type="cuda", dtype=torch.float32)
-    def process_video_sam2(self, support_set, video_query_set, class_id, dir_name, evaluator, device, data_dir="./output", class_name=None, use_support_visuals=False, gen_labels=False):
+    def process_video_sam2(self, support_set, video_query_set, class_id, dir_name, evaluator, device, data_dir="./output", class_name=None, use_support_visuals=False, gen_labels=False, eval_present_frames_only=False):
         video_predictor = self.video_predictor
         print(f"Processing video: {dir_name}")
         base_dir = f"{data_dir}/{dir_name}"
@@ -377,14 +378,24 @@ class SAM3_FSVOS_TEXT:
 
         # Load query frames in sorted order
         segmented_masks = []
-        query_masks_gt = [mask for _, mask in video_query_set]
+        # if eval_present_frames_only is True, only consider frames where the object is present in the gt
+        query_masks_gt = []
+        query_indices = []
+        for i, (_, mask) in enumerate(video_query_set):
+            if eval_present_frames_only and np.sum(mask) == 0:
+                continue
+            query_masks_gt.append(mask)
+            query_indices.append(i)
+
         
         for i, (query_img, query_mask) in enumerate(video_query_set):
             query_frame = np.array(query_img)
             # Frame indices in outputs_per_frame are 0-indexed from the frames directory
             query_frame_idx = i + 1 if use_support_visuals else i  # Frames saved are 0-indexed
             
-            # Extract merged mask for current query frame
+            # Extract merged mask for current query frame, only if the frame is in query_indices
+            if query_frame_idx not in query_indices:
+                continue
             self.save_mask_overlay(query_frame, query_mask, f"{ground_truth_dir}/query_{i:04d}.png")
             if query_frame_idx in video_segments and video_segments[query_frame_idx] is not None:
                 mask = video_segments[query_frame_idx]
@@ -399,6 +410,8 @@ class SAM3_FSVOS_TEXT:
                 self.save_image(empty_mask.astype(np.uint8)*255, f"{prediction_dir}/out_mask_{i:04d}.png")
                 print(f"  WARNING: No mask found for query frame {i} (frame_idx {query_frame_idx})")
                
+        assert len(segmented_masks) == len(query_masks_gt) # this must be true everytime, regardless of the eval_present_frames_only flag
+
         print(f"Segmentation complete! Generated {len(segmented_masks)} masks")
         print("Updating evaluation metrics")
         evaluator.update_evl(class_id, query_masks_gt, segmented_masks)
@@ -512,7 +525,7 @@ class SAM3_FSVOS_TEXT:
         test_evaluations = Evaluator(class_list=test_list, verbose=self.verbose)
         support_set = []
         start_time = time.perf_counter()
-
+        
         if self.args.gen_labels:
             label_generator = LabelGenerator(self.args)
 
@@ -520,7 +533,7 @@ class SAM3_FSVOS_TEXT:
 
             if self.benchmark == "youtube-fsvos":
                 video_query_img, video_query_mask, new_support_img, new_support_mask, class_id, dir_name, begin_new = data
-
+                
                 if begin_new:
                     support_set = [(img, mask) for img, mask in zip(new_support_img, new_support_mask)]
                     class_name = test_dataset.idx_to_classname[class_id]
@@ -532,14 +545,14 @@ class SAM3_FSVOS_TEXT:
                 class_name = test_dataset.idx_to_classname[class_id]
 
             if self.args.gen_labels:
-                if (self.benchmark == "youtube-fsvos" and begin_new) or (self.benchmark == "minivspw"):
+                if (self.benchmark == "youtube-fsvos-video") or (self.benchmark == "minivspw-video"):
                     # new_support_img is a list of numpy arrays in (H, W, C) format
                     # new_support_mask is a list of numpy arrays in (H, W, 1) format
                     # Stack them and convert to tensors with proper format for VLM:
                     # support_imgs: (bs=1, ns, c, h, w)
                     # support_masks: (bs=1, ns, h, w)
-                    support_imgs = torch.tensor(np.stack(new_support_img, axis=0)).permute(0, 3, 1, 2).unsqueeze(0)
-                    support_masks = torch.tensor(np.stack(new_support_mask, axis=0)).squeeze(-1).unsqueeze(0)
+                    support_imgs = torch.tensor(np.stack(support_img, axis=0)).permute(0, 3, 1, 2).unsqueeze(0)
+                    support_masks = torch.tensor(np.stack(support_mask, axis=0)).squeeze(-1).unsqueeze(0)
                     
                     print("support set shape: ", support_imgs.shape, support_masks.shape)
 
@@ -566,7 +579,9 @@ class SAM3_FSVOS_TEXT:
                 data_dir=output_directory,
                 class_name=class_name,
                 use_support_visuals=self.args.use_support_visuals,
-                gen_labels=self.args.gen_labels)
+                gen_labels=self.args.gen_labels,
+                eval_present_frames_only=self.args.eval_present_frames_only
+                )
             
             print(f"F-score list: {test_evaluations.f_score}")
             print(f"J-score list: {test_evaluations.j_score}")
