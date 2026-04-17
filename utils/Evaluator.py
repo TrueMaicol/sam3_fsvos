@@ -1,5 +1,6 @@
 import numpy as np
 from utils.davis_JF import db_eval_boundary, db_eval_iou
+import torch
 
 def measure(y_in, pred_in):
     thresh = .5
@@ -59,9 +60,58 @@ class Evaluator():
         self.iou_small_list = [0] * self.num_classes
         self.iou_medium_list = [0] * self.num_classes
         self.iou_large_list = [0] * self.num_classes
-        
 
-    def update_evl(self, class_idx, ground_truth_masks, pred_masks, sample_id=None):
+        self.pt_hit_list = [0] * self.num_classes
+        self.pt_total_list = [0] * self.num_classes
+        self.all_pt_hit_list = [0] * self.num_classes
+        self.all_pt_total_list = [0] * self.num_classes
+
+        self.pt_accuracy = [0] * self.num_classes
+        self.all_point_accuracy = [0] * self.num_classes
+
+        self.pt_sum_ratios = [0] * self.num_classes
+        self.pt_ratios_count = [0] * self.num_classes
+        self.all_pt_sum_ratios = [0] * self.num_classes
+        self.all_pt_ratios_count = [0] * self.num_classes
+
+        self.pt_accuracy_macro = [0] * self.num_classes
+        self.all_point_accuracy_macro = [0] * self.num_classes
+        
+    def evaluate_points_overlap(self, rescaled_pts, gt_mask):
+        """
+        rescaled_pts: numpy array of shape [N, 2] or [N, 1, 2] containing points in un-normalized image dimensions
+        gt_mask: 2D numpy array or tensor representing the ground truth mask for the query image
+        """
+        if rescaled_pts is None:
+            return 0, 0
+            
+        if torch.is_tensor(rescaled_pts):
+            rescaled_pts = rescaled_pts.cpu().numpy()
+            
+        if len(rescaled_pts.shape) == 3:
+            rescaled_pts = rescaled_pts[:, 0, :]
+            
+        gt_arr = np.array(gt_mask)
+        if gt_arr.ndim > 2:
+            gt_arr = gt_arr.squeeze()
+            
+        gt_arr = gt_arr.astype(bool)
+        h, w = gt_arr.shape
+        
+        hits = 0
+        total = len(rescaled_pts)
+        if total == 0:
+            return 0, 0
+            
+        for x, y in rescaled_pts:
+            px = int(np.round(np.clip(x, 0, w - 1)))
+            py = int(np.round(np.clip(y, 0, h - 1)))
+            if gt_arr[py, px]:
+                hits += 1
+                
+        return hits, total
+
+    def update_evl(self, class_idx, ground_truth_masks, pred_masks, sample_id=None, points_list=None, all_points_list=None):
         """
         Update evaluation metrics for a single sample
         
@@ -126,12 +176,38 @@ class Evaluator():
                 self.total_large_list[id] += total
 
 
+            pt_hits, pt_total = 0, 0
+            if points_list is not None and j < len(points_list):
+                pt_hits, pt_total = self.evaluate_points_overlap(points_list[j], ground_truth_masks[j])
+            
+            all_pt_hits, all_pt_total = 0, 0
+            if all_points_list is not None and j < len(all_points_list):
+                all_pt_hits, all_pt_total = self.evaluate_points_overlap(all_points_list[j], ground_truth_masks[j])
+
+            pt_score = float(pt_hits) / pt_total if pt_total > 0 else -1.0
+            all_pt_score = float(all_pt_hits) / all_pt_total if all_pt_total > 0 else -1.0
+
+            self.pt_hit_list[id] += pt_hits
+            self.pt_total_list[id] += pt_total
+            self.all_pt_hit_list[id] += all_pt_hits
+            self.all_pt_total_list[id] += all_pt_total
+
+            if pt_total > 0:
+                self.pt_sum_ratios[id] += pt_score
+                self.pt_ratios_count[id] += 1
+            if all_pt_total > 0:
+                self.all_pt_sum_ratios[id] += all_pt_score
+                self.all_pt_ratios_count[id] += 1
+
             # sample_details contains the IoU for each individual image, and the relative pixel ratio w.r.t. the gt. We cannot use the tp/total because that's an incremental approach, and we need an atomic value for each image
             self.sample_details[id].append({
                 "sample_id": sample_id,
                 "j_score": y,
                 "f_score": x,
                 "pixel_ratio": ratio,
+                "point_score": pt_score,
+                "all_point_score": all_pt_score,
+                "num_total_points": len(points_list), # record the total number of points computed by Matcher upon this sample
                 "size_category": "SMALL" if ratio < self.threshold["SMALL"] else "MEDIUM" if ratio < self.threshold["MEDIUM"] else "LARGE"
             })
 
@@ -161,6 +237,18 @@ class Evaluator():
         self.j_score = [self.j_list[ic] /
                         float(max(self.n_list[ic], 1))
                         for ic in range(self.num_classes)]
+        self.pt_accuracy = [self.pt_hit_list[ic] /
+                           float(max(self.pt_total_list[ic], 1))
+                           for ic in range(self.num_classes)]
+        self.all_point_accuracy = [self.all_pt_hit_list[ic] /
+                                  float(max(self.all_pt_total_list[ic], 1))
+                                  for ic in range(self.num_classes)]
+        self.pt_accuracy_macro = [self.pt_sum_ratios[ic] /
+                                 float(max(self.pt_ratios_count[ic], 1))
+                                 for ic in range(self.num_classes)]
+        self.all_point_accuracy_macro = [self.all_pt_sum_ratios[ic] /
+                                        float(max(self.all_pt_ratios_count[ic], 1))
+                                        for ic in range(self.num_classes)]
 
     def test_in_train(self, query_label, pred):
         assert len(query_label) == len(pred)

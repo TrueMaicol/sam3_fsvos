@@ -9,9 +9,6 @@ import json
 import sys
 import pandas as pd
 
-import nltk
-from nltk.corpus import wordnet as wn
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from YoutubeFSVOS.transform import TestTransform
 
@@ -205,12 +202,17 @@ class ADE20K_Dataset(Dataset):
 
 if __name__ == "__main__":
     # Test block
-    dataset = ADE20K_Dataset(data_dir="/leonardo_work/IscrC_MARSv2/datasets/ADE20K/ADE20K_2021_17_01", split="val", transform=TestTransform(size=518), use_synset_names=False)
+    dataset = ADE20K_Dataset(
+        data_dir="/leonardo_work/IscrC_MARSv2/datasets/ADE20K/ADE20K_2021_17_01", 
+        split="val", 
+        transform=TestTransform(size=518), 
+        use_synset_names=True, 
+        synset_mapping_csv_path="/leonardo_work/IscrC_MARSv2/datasets/synset_mappings/leaf/ADE20K.csv",
+        use_grouping=True
+    )
     
-    nltk.data.path.append('/leonardo_work/IscrC_MARSv2/datasets/NLTK_WORDNET')
-
-    print("ID|LABELS|SYNSET")
+    print("ID|LABEL|NUM_IMAGES")
     print("------------------------------------")
     for idx in dataset.get_class_ids():
-        print(f"{idx}|{dataset.idx_to_classname[idx]}|{dataset.index['wordnet_level1'][idx-1]}")
+        print(f"{idx}|{dataset.idx_to_classname[idx]}|{dataset.img_per_cat[idx]}")
         

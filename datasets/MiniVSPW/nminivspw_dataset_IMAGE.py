@@ -109,7 +109,8 @@ class NMiniVSPWEpisodicData_IMAGE(EpisodicData):
         class_list = None,
         args = None,
         n_frames: int = None,  # Number of frames to sub-sample (None = all frames)
-        seed_offset: int = 42,  # Seed offset for reproducible class selection
+        seed: int = 42,  # Base seed
+        run_number: int = 1, # Run number
         use_synset_names: bool = False,
         synset_mapping_csv_path = None,
         **kwargs
@@ -135,7 +136,8 @@ class NMiniVSPWEpisodicData_IMAGE(EpisodicData):
             _data_list_path = data_list_path
         self.benchmark = 'minivspw-image'
         self.n_frames = n_frames
-        self.seed_offset = seed_offset
+        self.seed = seed
+        self.run_number = run_number
         self.shortenend_videos = 0
         self.use_synset_names = use_synset_names
 
@@ -303,8 +305,8 @@ class NMiniVSPWEpisodicData_IMAGE(EpisodicData):
             support_masks: [shot x T x 1 x H x W]
             subcls_list: List[int] chosen classes
         """
-        # Use per-index RNG for reproducible class selection across runs
-        index_rng = np.random.RandomState(seed=index + self.seed_offset)
+        # Use per-index RNG for reproducible class selection across runs and workers
+        index_rng = np.random.RandomState(seed=index + self.seed + (self.run_number * 10000))
         
         seq_name = self.data_list[index]
         classes = self.classes_per_seq[seq_name]
@@ -327,7 +329,7 @@ class NMiniVSPWEpisodicData_IMAGE(EpisodicData):
             if len(valid_frame_indices) >= self.n_frames:
                 print(f"Selected {len(valid_frame_indices)} frames for sequence {seq_name}")
                 # Randomly select n_frames from valid frames
-                selected_indices = np.random.choice(valid_frame_indices, self.n_frames, replace=False)
+                selected_indices = index_rng.choice(valid_frame_indices, self.n_frames, replace=False)
             else:
                 self.shortenend_videos += 1
                 selected_indices = valid_frame_indices
@@ -339,28 +341,34 @@ class NMiniVSPWEpisodicData_IMAGE(EpisodicData):
             qry_frames, qry_masks = self.transform(qry_frames, qry_masks)
         else:
             print("No transform specified")
-        # qry_frames is a list of [H, W, C] numpy arrays
-        # qry_masks is a list of [H, W, 1] numpy arrays - squeeze to [H, W]
-        qry_masks = [m.squeeze() for m in qry_masks]
-        support_frames, support_masks = [], []
+        # After transform, qry_frames is [T, C, H, W] and qry_masks is [T, 1, H, W]
+        # Squeeze the channel dim to get [T, H, W], keeping it as a tensor
+        qry_masks = qry_masks.squeeze(1)
+        support_frames_list, support_masks_list = [], []
         selected_seqs = list(self.seqs_per_cls[chosen_class].keys())
         selected_seqs.remove(seq_name)
         for shot in range(self.shot):
-            sprt_seq = np.random.choice(selected_seqs)
+            sprt_seq = index_rng.choice(selected_seqs)
             sprt_frames, sprt_masks = self._load_seq(sprt_seq, chosen_class,
                                                     self.seqs_per_cls[chosen_class][sprt_seq])
-            if self.transform is not None:
-                sprt_frames, sprt_masks = self.transform(sprt_frames, sprt_masks)
             
             if not self.sprtset_as_frames:
-                # Pick a random single frame from the support sequence
-                rnd_idx = np.random.randint(0, len(sprt_frames))
-                sprt_frames = sprt_frames[rnd_idx]  # [H, W, C]
-                sprt_masks = sprt_masks[rnd_idx].squeeze()  # [H, W]
-            support_frames.append(sprt_frames)
-            support_masks.append(sprt_masks)
+                # Pick a random single frame from the support sequence (in numpy format)
+                rnd_idx = index_rng.randint(0, len(sprt_frames))
+                support_frames_list.append(sprt_frames[rnd_idx])
+                support_masks_list.append(sprt_masks[rnd_idx])
+            else:
+                support_frames_list.extend(sprt_frames)
+                support_masks_list.extend(sprt_masks)
+
         subcls_list = [chosen_class]
-        # Return lists of numpy arrays (same format as YouTube-FSVOS)
+        if len(support_frames_list) > 0 and self.transform is not None:
+            support_frames, support_masks = self.transform(support_frames_list, support_masks_list)
+            # After transform, support_masks is [shot_total, 1, H, W]
+            # support_masks = support_masks.squeeze(1)
+        else:
+            support_frames = None
+            support_masks = None
         return qry_frames, qry_masks, support_frames, support_masks, subcls_list, seq_name, selected_indices
         
     def get_class_ids(self):

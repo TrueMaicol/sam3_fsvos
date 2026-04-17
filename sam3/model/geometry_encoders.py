@@ -586,11 +586,11 @@ class SequenceGeometryEncoder(nn.Module):
         self.mask_encoder = mask_encoder
         self.use_act_ckpt = use_act_ckpt
 
-    def _encode_points(self, points, points_mask, points_labels, img_feats):
+    def _encode_points(self, points, points_mask, points_labels, img_feats, skip_coords=False):
         points_embed = None
         n_points, bs = points.shape[:2]
 
-        if self.points_direct_project is not None:
+        if not skip_coords and self.points_direct_project is not None:
             proj = self.points_direct_project(points)
             assert points_embed is None
             points_embed = proj
@@ -613,7 +613,7 @@ class SequenceGeometryEncoder(nn.Module):
             else:
                 points_embed = points_embed + proj
 
-        if self.points_pos_enc_project is not None:
+        if not skip_coords and self.points_pos_enc_project is not None:
             x, y = points.unbind(-1)
             enc_x, enc_y = self.pos_enc._encode_xy(x.flatten(), y.flatten())
             enc_x = enc_x.view(n_points, bs, enc_x.shape[-1])
@@ -626,14 +626,22 @@ class SequenceGeometryEncoder(nn.Module):
             else:
                 points_embed = points_embed + proj
 
+        # safe fallback, if skip_coords and no other encoding is available the points_embed will be None. Assign a zero tensor to avoid errors
+        if points_embed is None:
+            points_embed = torch.zeros(
+                (n_points, bs, self.d_model),
+                device=points.device,
+                dtype=img_feats.dtype if img_feats is not None else points.dtype,
+            )
+
         type_embed = self.label_embed(points_labels.long())
         return type_embed + points_embed, points_mask
 
-    def _encode_boxes(self, boxes, boxes_mask, boxes_labels, img_feats):
+    def _encode_boxes(self, boxes, boxes_mask, boxes_labels, img_feats, skip_coords=False):
         boxes_embed = None
         n_boxes, bs = boxes.shape[:2]
 
-        if self.boxes_direct_project is not None:
+        if not skip_coords and self.boxes_direct_project is not None:
             proj = self.boxes_direct_project(boxes)
             assert boxes_embed is None
             boxes_embed = proj
@@ -664,7 +672,7 @@ class SequenceGeometryEncoder(nn.Module):
             else:
                 boxes_embed = boxes_embed + proj
 
-        if self.boxes_pos_enc_project is not None:
+        if not skip_coords and self.boxes_pos_enc_project is not None:
             cx, cy, w, h = boxes.unbind(-1)
             enc = self.pos_enc.encode_boxes(
                 cx.flatten(), cy.flatten(), w.flatten(), h.flatten()
@@ -676,6 +684,13 @@ class SequenceGeometryEncoder(nn.Module):
                 boxes_embed = proj
             else:
                 boxes_embed = boxes_embed + proj
+
+        if boxes_embed is None:
+            boxes_embed = torch.zeros(
+                (n_boxes, bs, self.d_model),
+                device=boxes.device,
+                dtype=img_feats.dtype if img_feats is not None else boxes.dtype,
+            )
 
         type_embed = self.label_embed(boxes_labels.long())
         return type_embed + boxes_embed, boxes_mask
@@ -714,7 +729,14 @@ class SequenceGeometryEncoder(nn.Module):
             masks = masks + self.mask_label_embed(mask_labels.long())
         return masks, attn_mask
 
-    def forward(self, geo_prompt: Prompt, img_feats, img_sizes, img_pos_embeds=None):
+    def forward(
+        self,
+        geo_prompt: Prompt,
+        img_feats,
+        img_sizes,
+        img_pos_embeds=None,
+        skip_coords=False,
+    ):
         points = geo_prompt.point_embeddings
         points_mask = geo_prompt.point_mask
         points_labels = geo_prompt.point_labels
@@ -783,6 +805,7 @@ class SequenceGeometryEncoder(nn.Module):
             points_mask=points_mask,
             points_labels=points_labels,
             img_feats=img_feats,
+            skip_coords=skip_coords,
         )
 
         if not self.encode_boxes_as_points:
@@ -791,6 +814,7 @@ class SequenceGeometryEncoder(nn.Module):
                 boxes_mask=boxes_mask,
                 boxes_labels=boxes_labels,
                 img_feats=img_feats,
+                skip_coords=skip_coords,
             )
 
             final_embeds, final_mask = concat_padded_sequences(

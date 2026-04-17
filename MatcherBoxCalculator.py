@@ -5,11 +5,12 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 class MatcherBoxCalculator():
-    def __init__(self, sam3_model=None):
+    def __init__(self, sam3_model=None, sam3_processor=None):
         if sam3_model is None:
             raise ValueError("sam3 model must be specified")
 
         self.model = sam3_model
+        self.processor = sam3_processor
         self.resolution = 1008 # hardcoded from SAM3
         self.input_size = (self.resolution, self.resolution)
         self.transform = v2.Compose(
@@ -60,13 +61,48 @@ class MatcherBoxCalculator():
             print(f"[MatcherBoxCalculator] Backbone Output Shape: {visual_features.shape}")
             
         b, c, h, w = visual_features.shape
-        feats = visual_features.view(b, c, -1).permute(0, 2, 1).reshape(-1, c)
+        # Cast to float32: the backbone produces bfloat16 (model is bfloat16),
+        # but matcher operations (scipy/numpy) require float32.
+        feats = visual_features.float().view(b, c, -1).permute(0, 2, 1).reshape(-1, c)
         print(f"[MatcherBoxCalculator] Flattened Features Shape: {feats.shape}")
         feats = F.normalize(feats, dim=1, p=2)
         
         return feats
 
-    def compute_box(self, reference_image=None, target_image=None, reference_mask=None):
+    def get_fused_image_features(self, image, text_prompt="visual", skip_coords=False):
+        if self.processor is None:
+            raise ValueError("sam3_processor must be provided to use fused features")
+            
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+
+        all_feats = []
+        for img in image:
+            state = self.processor.set_image(img)
+            text_outputs = self.processor.model.backbone.forward_text([text_prompt], device=self.processor.device)
+            state["backbone_out"].update(text_outputs)
+            state["geometric_prompt"] = self.processor.model._get_dummy_prompt()
+            
+            prompt, prompt_mask, backbone_out = self.processor.model._encode_prompt(
+                backbone_out=state["backbone_out"],
+                find_input=self.processor.find_stage,
+                geometric_prompt=state["geometric_prompt"],
+                encode_text=True,
+                skip_coords=skip_coords
+            )
+            
+            backbone_out, encoder_out, _ = self.processor.model._run_encoder(
+                backbone_out, self.processor.find_stage, prompt, prompt_mask
+            )
+            
+            feat = encoder_out["encoder_hidden_states"].squeeze(1).float()
+            feat = F.normalize(feat, dim=1, p=2)
+            all_feats.append(feat)
+
+        out_feats = torch.cat(all_feats, dim=0)
+        return out_feats
+
+    def compute_box(self, reference_image=None, target_image=None, reference_mask=None, text_prompt="visual", use_fused_matcher_features=False, skip_coords=False):
         if reference_image is None or target_image is None:
             raise ValueError("Reference or Target image is not specified")
         
@@ -94,19 +130,27 @@ class MatcherBoxCalculator():
         print(f"[MatcherBoxCalculator] Pooled Mask Grid Shape: {ref_masks_pool_grid.shape}")
         self.ref_masks_pool = (ref_masks_pool_grid > 0.01).float().reshape(-1)
 
-        ref_features = self.get_image_features(reference_image)
-        target_features = self.get_image_features(target_image)
+        if use_fused_matcher_features:
+            ref_features = self.get_fused_image_features(reference_image, text_prompt, skip_coords)
+            target_features = self.get_fused_image_features(target_image, text_prompt, skip_coords)
+        else:
+            ref_features = self.get_image_features(reference_image)
+            target_features = self.get_image_features(target_image)
 
-        # Returns: ponits, negative_priors if len(negative_priors) > 0 else points_discarded, box, self.S, C, reduced_points_num, reduced_points_num_neg
+        # Returns: ponits, negative_priors if len(negative_priors) > 0 else points_discarded, box, self.S, C, reduced_points_num, reduced_points_num_neg, matched_features, target_features, matched_indices_in_all
         results = self.patch_level_matching(ref_features, target_features)
         box = results[2]
         points = results[0]
-        return box, points
+        matched_features = results[7]
+        all_target_features = results[8]
+        matched_indices_in_all = results[9]
+        return box, points, matched_features, all_target_features, matched_indices_in_all
 
     def patch_level_matching(self, ref_feats, tar_feat):
         """
         Performs patch-level matching between the reference and target image features.
         """
+        self.tar_feat = tar_feat
         # forward matching
         self.S = ref_feats @ tar_feat.t()  # S = ns*N x N
 
@@ -121,7 +165,7 @@ class MatcherBoxCalculator():
         # Patches in the reference/support image feature(s) and the target image features are seen as nodes in a bipartite graph.
         # The similarity matrix S is used to compute the optimal matching between the two sets of nodes.
         indices_forward = linear_sum_assignment(
-            self.S_forward.cpu(), maximize=True)
+            self.S_forward.float().cpu(), maximize=True)
 
         # Indices forward will contain 2 tuples: the first tuple will contain the indices of the reference patches, the second tuple will contain the
         # indices of the target patches that have been matched. We first convert them to tensors and then from the similarity matrix S_forward we extract
@@ -143,7 +187,7 @@ class MatcherBoxCalculator():
 
         # indices_reverse will contain 2 tuples: the first tuple will contain the indices of the target patches,
         indices_reverse = linear_sum_assignment(
-            self.S_reverse.cpu(), maximize=True)
+            self.S_reverse.float().cpu(), maximize=True)
         # the second tuple will contain the indices of the reference patches that have been matched.
         indices_reverse = [torch.as_tensor(
             index, dtype=torch.int64, device=self.device) for index in indices_reverse]
@@ -183,11 +227,26 @@ class MatcherBoxCalculator():
         points_matched_inds = indices_forward_pos[1][sim_filter]
         points_unmatched_inds = indices_forward_neg[1]
 
-        # removing duplicates from positive priors (for the few-shot scenario)
-        points_matched_inds_set = torch.tensor(
-            list(set(points_matched_inds.cpu().tolist())))
-        points_unmatched_inds_set = torch.tensor(
-            list(set(points_unmatched_inds.cpu().tolist())))
+        # removing duplicates while preserving the similarity order - (Deterministic Baseline)
+        unique_inds = []
+        seen = set()
+        for ind in points_matched_inds.cpu().tolist():
+            if ind not in seen:
+                unique_inds.append(ind)
+                seen.add(ind)
+        points_matched_inds_set = torch.tensor(unique_inds, device=self.device)
+        
+        # get the features of the matched points
+        matched_features = self.tar_feat[points_matched_inds_set]
+
+        # for negative priors (unmatched)
+        unique_inds_neg = []
+        seen_neg = set()
+        for ind in points_unmatched_inds.cpu().tolist():
+            if ind not in seen_neg:
+                unique_inds_neg.append(ind)
+                seen_neg.add(ind)
+        points_unmatched_inds_set = torch.tensor(unique_inds_neg, device=self.device)
 
         # getting the x coordinate of the matched points
         points_matched_inds_set_w = points_matched_inds_set % self.encoder_feat_size
@@ -210,15 +269,19 @@ class MatcherBoxCalculator():
 
         ponits_matched = []
         points_discarded = []
-        for x, y in zip(idxs_mask_set_x, idxs_mask_set_y):
+        keep_indices = []
+        # retaining only the points that are within the image shape
+        for i, (x, y) in enumerate(zip(idxs_mask_set_x, idxs_mask_set_y)):
             if int(x) < self.input_size[1] and int(y) < self.input_size[0]:
                 ponits_matched.append([int(x), int(y)])
+                keep_indices.append(i)
 
         for x, y in zip(idxs_mask_set_x_unmatched, idxs_mask_set_y_unmatched):
             if int(x) < self.input_size[1] and int(y) < self.input_size[0]:
                 points_discarded.append([int(x), int(y)])
 
         ponits = np.array(ponits_matched)
+        matched_features = matched_features[keep_indices]
         points_discarded = np.array(points_discarded)
 
         # Sampling negative points from the discarded points and from the cost matrix.
@@ -248,7 +311,7 @@ class MatcherBoxCalculator():
         else:
             box = None
 
-        return ponits, negative_priors if len(negative_priors) > 0 else points_discarded, box, self.S, C, reduced_points_num, reduced_points_num_neg
+        return ponits, negative_priors if len(negative_priors) > 0 else points_discarded, box, self.S, C, reduced_points_num, reduced_points_num_neg, matched_features, self.tar_feat, points_matched_inds_set[keep_indices]
 
     def sample_negative_points_from_discarded(self, idxs_forward, sim_scores_forward, idxs_reverse, idxs_mask):
         # I want to retain the indices that are not matched to use them as negative priors.
@@ -301,7 +364,7 @@ class MatcherBoxCalculator():
 
         # Perform forward matching to find the most similar patches in the target image for each patch in the reference image.
         indices_forward_neg = linear_sum_assignment(
-            C_forward.cpu(), maximize=True)
+            C_forward.float().cpu(), maximize=True)
         indices_forward_neg = [torch.as_tensor(
             index, dtype=torch.int64, device=self.device) for index in indices_forward_neg]
         cost_scores_forward = C_forward[indices_forward_neg[0],
@@ -312,7 +375,7 @@ class MatcherBoxCalculator():
 
         # Perform reverse matching to find the patches in the reference image that are most similar to each patch in the target image.
         C_reverse = C.t()[indices_forward_neg[1]]
-        indices_reverse = linear_sum_assignment(C_reverse.cpu(), maximize=True)
+        indices_reverse = linear_sum_assignment(C_reverse.float().cpu(), maximize=True)
         indices_reverse = [torch.as_tensor(
             index, dtype=torch.int64, device=self.device) for index in indices_reverse]
         retain_ind = torch.isin(indices_reverse[1], indices_mask, invert=True)

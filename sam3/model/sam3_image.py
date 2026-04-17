@@ -173,6 +173,8 @@ class Sam3Image(torch.nn.Module):
         visual_prompt_mask=None,
         encode_text=True,
         prev_mask_pred=None,
+        # skip_coords: if True, coordinate-based embeddings will be skipped
+        skip_coords=False,
     ):
         # index text features (note that regardless of early or late fusion, the batch size of
         # `txt_feats` is always the number of *prompts* in the encoder)
@@ -191,6 +193,7 @@ class Sam3Image(torch.nn.Module):
             img_feats=img_feats,
             img_sizes=vis_feat_sizes,
             img_pos_embeds=img_pos_embeds,
+            skip_coords=skip_coords,
         )
         if visual_prompt_embed is None:
             visual_prompt_embed = torch.zeros(
@@ -443,11 +446,12 @@ class Sam3Image(torch.nn.Module):
         find_input,
         find_target,
         geometric_prompt: Prompt,
+        skip_coords: bool = False,
         **kwargs,
     ):
         with torch.profiler.record_function("SAM3Image._encode_prompt"):
             prompt, prompt_mask, backbone_out = self._encode_prompt(
-                backbone_out, find_input, geometric_prompt
+                backbone_out, find_input, geometric_prompt, skip_coords=skip_coords
             )
         # Run the encoder
         with torch.profiler.record_function("SAM3Image._run_encoder"):

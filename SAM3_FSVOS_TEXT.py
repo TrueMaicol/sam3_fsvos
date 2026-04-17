@@ -512,13 +512,9 @@ class SAM3_FSVOS_TEXT:
                 data_root=self.dataset_path,
                 data_list_path=self.data_list_path,
                 transform=TestTransform(size=518) ,
+                seed=seed,
+                run_number=self.run_number
             )
-            state_manager = RandomStateManager(save_dir=self.random_state_path)
-
-            if self.run_number == 1:
-                state_manager.initialize_seed(seed=seed)
-            else:
-                state_manager.load_state(fold=fold, run_number=self.run_number-1)
         test_list = test_dataset.get_class_ids() 
 
         print('test_group:',fold, '  test_num:', len(test_dataset), '  class_list:', test_list, ' dataset_path:', self.dataset_path)
@@ -530,6 +526,11 @@ class SAM3_FSVOS_TEXT:
             label_generator = LabelGenerator(self.args)
 
         for index, data in enumerate(test_dataset):
+            # Deterministic seed for every episode
+            current_seed = seed + (self.run_number * 10000) + index
+            random.seed(current_seed)
+            np.random.seed(current_seed)
+            torch.manual_seed(current_seed)
 
             if self.benchmark == "youtube-fsvos":
                 video_query_img, video_query_mask, new_support_img, new_support_mask, class_id, dir_name, begin_new = data

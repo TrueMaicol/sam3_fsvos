@@ -18,8 +18,6 @@ from torch.utils.data import DataLoader
 from MatcherBoxCalculator import MatcherBoxCalculator
 
 
-
-
 def fix_randseed(seed):
     r""" Set random seeds for reproducibility """
     if seed is None:
@@ -42,7 +40,7 @@ def validate_args(args):
 def get_arguments():
         parser = argparse.ArgumentParser(description='FSVOS')
         parser.add_argument("--checkpoint", type=str, default=None)
-        parser.add_argument("--benchmark", type=str, default="youtube-fsvos", choices=["youtube_fsvos", "minivspw", "coco", "lvis", "ade20k", "pascal"])
+        parser.add_argument("--benchmark", type=str, default="youtube-fsvos", choices=["youtube_fsvos", "minivspw", "coco", "lvis", "ade20k", "pascal", "coco-20i", "lvis-92i", "pascal-5i"])
         parser.add_argument("--session_name", type=str, default=None)
         parser.add_argument("--dataset_path", type=str, default=None)
         parser.add_argument("--data_list_path", type=str, default=None)
@@ -55,7 +53,8 @@ def get_arguments():
         parser.add_argument("--use_grouping_ade20k", action="store_true", default=False, help="Enable grouping of classes using JSON [ONLY ON ADE20K].")
         parser.add_argument("--all_lemmas", action="store_true", default=False, help="Iterate over all lemmas, instead of just the one selected inside the mapping")
         parser.add_argument("--matcher_box", action="store_true", default=False, help="Use bipartite matching from matcher to get a bounding box on the target image. Requires n_shot > 0")
-
+        parser.add_argument("--run_n", type=int, default=0)
+        parser.add_argument("--random_state_dir", type=str, default="/leonardo_work/IscrC_MARSv2/SAM3_FSVOS/src/minivspw_random_state/VSPW/SAM3_GEN_LABEL_SUPPORT/${6}-SHOT")
         # Random state management
         parser.add_argument('--seed', type=int, default=0)
 
@@ -266,19 +265,12 @@ def main():
 
     random.seed(args.seed)  
     fix_randseed(args.seed)
-   
+
     if args.matcher_box:
         matcher_box_calculator = MatcherBoxCalculator(sam3_model=sam3.model)
 
     # create the dataset from the builder
     loader = ImageDataset(args.benchmark, args)
-    dataloader = DataLoader(
-        loader,
-        batch_size=None,
-        num_workers=1,
-        shuffle=False,
-        prefetch_factor=0
-    )
 
     dataset = loader.dataset
         
@@ -316,6 +308,11 @@ def main():
     print("STARTING SEGMENTATION")
     print("-" * 50)
     for idx, data in enumerate(loader):
+        # Deterministic seed for every episode
+        current_seed = args.seed + (args.run_n * 10000) + idx
+        random.seed(current_seed)
+        np.random.seed(current_seed)
+        torch.manual_seed(current_seed)
         
         query_imgs = data['query_imgs']
         query_masks = data['query_masks']
@@ -329,7 +326,7 @@ def main():
         print(f"query_imgs shape: {query_imgs.shape}")
         print(f"query_masks shape: {query_masks.shape}")
 
-        if support_imgs is not None and support_masks is not None:
+        if support_imgs is not None and support_masks is not None and len(support_imgs) > 0:
             print(f"support_imgs shape: {support_imgs.shape}")
             print(f"support_masks shape: {support_masks.shape}")
 
@@ -387,14 +384,14 @@ def main():
                     save_image_with_box(image=img_numpy, box=box, output_path=os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}.png"))
                     save_image_with_points(image=img_numpy, points=points, output_path=os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}_points.png"))
                     sam3_box = convert_box_to_sam3_format(box=box, image_size=518)
-                    sam3_points = convert_points_to_sam3_format(points=points, image_size=518)
+                    # sam3_points = convert_points_to_sam3_format(points=points, image_size=518)
                     box_coordinates.append(sam3_box)
-                    print(f"Box: {box}")
-                    print(f"SAM3 Box: {sam3_box}")
+                    # print(f"Box: {box}")
+                    # print(f"SAM3 Box: {sam3_box}")
 
                 if args.matcher_box:
-                    # prediction = sam3.prompt_text_with_box(image=query_frame, text_prompt=lemma, box=sam3_box)
-                    prediction = sam3.prompt_text_with_points(image=query_frame, text_prompt=lemma, points=sam3_points)
+                    prediction = sam3.prompt_text_with_box(image=query_frame, text_prompt=lemma, box=sam3_box)
+                    # prediction = sam3.prompt_text_with_points(image=query_frame, text_prompt=lemma, points=sam3_points)
                 else:
                     prediction = sam3.prompt_text(image=query_frame, text_prompt=lemma)
                 img_pil = Image.fromarray(img_numpy)

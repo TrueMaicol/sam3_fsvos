@@ -105,6 +105,8 @@ class NMiniVSPWEpisodicData(EpisodicData):
         transform = None,
         class_list = None,
         args = None,
+        seed: int = 42,
+        run_number: int = 1,
         **kwargs
     ):
         # Support both individual parameters and args object
@@ -138,6 +140,9 @@ class NMiniVSPWEpisodicData(EpisodicData):
         self.class_list_current = list(class_dic.keys())
         self.class_ids = self.class_list_current
         self.nclass = len(self.class_ids)
+
+        self.seed = seed
+        self.run_number = run_number
         # Call parent class __init__ with the necessary parameters
         # Note: EpisodicData expects transform, class_list, data_list_path, and args-like params
         # We create a minimal object with the required attributes
@@ -268,9 +273,13 @@ class NMiniVSPWEpisodicData(EpisodicData):
             support_masks: [shot x T x 1 x H x W]
             subcls_list: List[int] chosen classes
         """
+        # Use per-index RNG for reproducible choices across workers and runs
+        # We use a large prime (10000) to offset runs to avoid overlap
+        g = np.random.RandomState(seed=index + self.seed + (self.run_number * 10000))
+        
         seq_name = self.data_list[index]
         classes = self.classes_per_seq[seq_name]
-        chosen_class = np.random.choice(classes)
+        chosen_class = g.choice(classes)
         qry_frames, qry_masks = self._load_seq(seq_name, chosen_class)
         if self.transform is not None:
             qry_frames, qry_masks = self.transform(qry_frames, qry_masks)
@@ -282,7 +291,7 @@ class NMiniVSPWEpisodicData(EpisodicData):
         selected_seqs = list(self.seqs_per_cls[chosen_class].keys())
         selected_seqs.remove(seq_name)
         for shot in range(self.shot):
-            sprt_seq = np.random.choice(selected_seqs)
+            sprt_seq = g.choice(selected_seqs)
             sprt_frames, sprt_masks = self._load_seq(sprt_seq, chosen_class,
                                                     self.seqs_per_cls[chosen_class][sprt_seq])
             if self.transform is not None:
@@ -290,7 +299,7 @@ class NMiniVSPWEpisodicData(EpisodicData):
             
             if not self.sprtset_as_frames:
                 # Pick a random single frame from the support sequence
-                rnd_idx = np.random.randint(0, len(sprt_frames))
+                rnd_idx = g.randint(0, len(sprt_frames))
                 sprt_frames = sprt_frames[rnd_idx]  # [H, W, C]
                 sprt_masks = sprt_masks[rnd_idx].squeeze()  # [H, W]
             support_frames.append(sprt_frames)

@@ -52,7 +52,7 @@ class Sam3Processor:
             raise ValueError("Image must be a PIL image or a tensor")
 
         image = v2.functional.to_image(image).to(self.device)
-        image = self.transform(image).unsqueeze(0)
+        image = self.transform(image).unsqueeze(0)        
 
         state["original_height"] = height
         state["original_width"] = width
@@ -151,6 +151,72 @@ class Sam3Processor:
 
         return self._forward_grounding(state)
 
+    @torch.inference_mode()
+    def add_point_prompts(self, coords: List, labels: List, state: Dict):
+        """Adds a set of point prompts. 
+        
+        Args:
+            coords: List of points, each point is a list of [x, y] in normalized [0, 1] range.
+            labels: List of booleans, True for positive points.
+            state: The processor state.
+        """
+        if "backbone_out" not in state:
+            raise ValueError("You must call set_image before add_point_prompts")
+        
+        # this is required because _encode_prompt expects language_features to be present, even in cases when it's not going to be used
+        if "language_features" not in state["backbone_out"]:
+            dummy_text_outputs = self.model.backbone.forward_text(
+                ["visual"], device=self.device
+            )
+            state["backbone_out"].update(dummy_text_outputs)
+
+        if "geometric_prompt" not in state:
+            state["geometric_prompt"] = self.model._get_dummy_prompt()
+        
+        # SAM3 expects (N_points, BatchSize, 2) and (N_points, BatchSize)
+        coords = torch.tensor(coords, device=self.device, dtype=torch.float32).view(-1, 1, 2)
+        labels = torch.tensor(labels, device=self.device, dtype=torch.bool).view(-1, 1)
+        state["geometric_prompt"].append_points(coords, labels)
+        
+        return state
+
+    @torch.inference_mode()
+    def _encode_current_prompts(self, state: Dict, encode_text: bool = True, skip_coords: bool = False):
+        """Encodes whatever prompts (boxes/points) are currently in geometric_prompt.
+        
+        This prepares the 'prompt' and 'prompt_mask' tokens for inference and removes
+        the raw geometric_prompt from state.
+        
+        Args:
+            state: The current processor state.
+            encode_text: If False, only geometric prompts will be encoded.
+            skip_coords: If True, coordinate-based embeddings will be skipped.
+        """
+        if "geometric_prompt" not in state:
+            return state
+
+        if encode_text and "language_features" not in state["backbone_out"]:
+            dummy_text_outputs = self.model.backbone.forward_text(
+                ["visual"], device=self.device
+            )
+            state["backbone_out"].update(dummy_text_outputs)
+
+        with torch.profiler.record_function("SAM3Image._encode_prompt"):
+            prompt, prompt_mask, backbone_out = self.model._encode_prompt(
+                backbone_out=state["backbone_out"],
+                find_input=self.find_stage,
+                geometric_prompt=state["geometric_prompt"],
+                encode_text=encode_text,
+                skip_coords=skip_coords
+            )
+
+        state["prompt"] = prompt
+        state["prompt_mask"] = prompt_mask
+        state["backbone_out"] = backbone_out
+
+        del state["geometric_prompt"]
+        return state
+
     def reset_all_prompts(self, state: Dict):
         """Removes all the prompts and results"""
         if "backbone_out" in state:
@@ -201,6 +267,91 @@ class Sam3Processor:
         out_bbox = out_bbox[keep]
 
         # convert to [x0, y0, x1, y1] format
+        boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
+
+        img_h = state["original_height"]
+        img_w = state["original_width"]
+        scale_fct = torch.tensor([img_w, img_h, img_w, img_h]).to(self.device)
+        boxes = boxes * scale_fct[None, :]
+
+        out_masks = interpolate(
+            out_masks.unsqueeze(1),
+            (img_h, img_w),
+            mode="bilinear",
+            align_corners=False,
+        ).sigmoid()
+
+        state["masks_logits"] = out_masks
+        state["masks"] = out_masks > 0.5
+        state["boxes"] = boxes
+        state["scores"] = out_probs
+        return state
+
+    @torch.inference_mode()
+    def _forward_with_encoded_prompt(self, state: Dict):
+        """Run inference using pre-encoded prompt and prompt_mask from state.
+
+        This skips the _encode_prompt step, useful for cross-image inference
+        where the prompt was encoded on a different image.
+
+        Requires state to contain: backbone_out, prompt, prompt_mask,
+        original_height, original_width.
+        """
+        prompt = state["prompt"]
+        prompt_mask = state["prompt_mask"]
+
+        # Run the encoder
+        with torch.profiler.record_function("SAM3Image._run_encoder"):
+            backbone_out, encoder_out, _ = self.model._run_encoder(
+                state["backbone_out"], self.find_stage, prompt, prompt_mask
+            )
+
+        out = {
+            "encoder_hidden_states": encoder_out["encoder_hidden_states"],
+            "prev_encoder_out": {
+                "encoder_out": encoder_out,
+                "backbone_out": backbone_out,
+            },
+        }
+
+        # Run the decoder
+        with torch.profiler.record_function("SAM3Image._run_decoder"):
+            out, hs = self.model._run_decoder(
+                memory=out["encoder_hidden_states"],
+                pos_embed=encoder_out["pos_embed"],
+                src_mask=encoder_out["padding_mask"],
+                out=out,
+                prompt=prompt,
+                prompt_mask=prompt_mask,
+                encoder_out=encoder_out,
+            )
+
+        # Run segmentation heads
+        with torch.profiler.record_function("SAM3Image._run_segmentation_heads"):
+            self.model._run_segmentation_heads(
+                out=out,
+                backbone_out=backbone_out,
+                img_ids=self.find_stage.img_ids,
+                vis_feat_sizes=encoder_out["vis_feat_sizes"],
+                encoder_hidden_states=out["encoder_hidden_states"],
+                prompt=prompt,
+                prompt_mask=prompt_mask,
+                hs=hs,
+            )
+
+        # Post-process outputs (same as _forward_grounding)
+        out_bbox = out["pred_boxes"]
+        out_logits = out["pred_logits"]
+        out_masks = out["pred_masks"]
+        out_probs = out_logits.sigmoid()
+        presence_score = out["presence_logit_dec"].sigmoid().unsqueeze(1)
+        out_probs = (out_probs * presence_score).squeeze(-1)
+
+        keep = out_probs > self.confidence_threshold
+        out_probs = out_probs[keep]
+        out_masks = out_masks[keep]
+        out_bbox = out_bbox[keep]
+
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
 
         img_h = state["original_height"]

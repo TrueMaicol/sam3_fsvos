@@ -81,9 +81,9 @@ class YTVOSDataset_Image(Dataset):
                 if lemmas_str is not None and pd.notna(lemmas_str):
                     self.class_idx_to_all_lemmas[idx] = [l.replace("_", " ") for l in str(lemmas_str).split(",")]
         else:
-            self.idx_to_classname = {cat['id']: cat['name'] for cat in categories}
+            self.idx_to_classname = {cat['id']: cat['name'] for cat in categories if cat['id'] in self.class_ids}
             
-        assert len(self.class_ids) == len(self.idx_to_classname.keys()), "The number of classes in the dataset does not match the number of classes in the label mapping."
+        assert len(self.class_ids) == len(self.idx_to_classname.keys()), f"The number of classes in the dataset ({len(self.class_ids)}) does not match the number of classes in the label mapping ({len(self.idx_to_classname.keys())})."
 
         self.video_ids = []
         for class_id in self.class_ids:
@@ -238,7 +238,7 @@ class YTVOSDataset_Image(Dataset):
                     support_frames, support_masks = self.transforms(support_frames, support_masks)
         vid_info = self.vid_infos[query_vid]
         vid_name = vid_info['dir']
-        return query_frames, query_masks, support_frames, support_masks, self.class_ids[list_id], vid_name, begin_new, chosen_frames
+        return query_frames, query_masks, support_frames if len(support_frames) > 0 else None, support_masks if len(support_masks) > 0 else None, self.class_ids[list_id], vid_name, begin_new, chosen_frames
 
     def __getitem__(self, idx):
         if self.train:
