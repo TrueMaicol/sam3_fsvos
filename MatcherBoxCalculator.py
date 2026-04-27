@@ -69,10 +69,10 @@ class MatcherBoxCalculator():
         
         return feats
 
-    def get_fused_image_features(self, image, text_prompt="visual", skip_coords=False):
+    def get_fused_image_features(self, image, text_prompt="visual", skip_coords=False, visual_prompt=None, visual_prompt_mask=None):
         if self.processor is None:
             raise ValueError("sam3_processor must be provided to use fused features")
-            
+
         if image.ndim == 3:
             image = image.unsqueeze(0)
 
@@ -81,20 +81,46 @@ class MatcherBoxCalculator():
             state = self.processor.set_image(img)
             text_outputs = self.processor.model.backbone.forward_text([text_prompt], device=self.processor.device)
             state["backbone_out"].update(text_outputs)
-            state["geometric_prompt"] = self.processor.model._get_dummy_prompt()
-            
-            prompt, prompt_mask, backbone_out = self.processor.model._encode_prompt(
-                backbone_out=state["backbone_out"],
-                find_input=self.processor.find_stage,
-                geometric_prompt=state["geometric_prompt"],
-                encode_text=True,
-                skip_coords=skip_coords
-            )
-            
+
+            # If visual prompts are provided, combine them with text prompts
+            if visual_prompt is not None and visual_prompt_mask is not None:
+                # text_outputs['language_features'] is [L, 1, C]
+                # text_outputs['language_mask'] is [1, L]
+                txt_tokens = text_outputs["language_features"][:, [0]]  # select first text prompt
+                txt_mask = text_outputs["language_mask"][[0]]
+
+                # Combine text tokens with visual tokens
+                combined_prompt = torch.cat([txt_tokens, visual_prompt], dim=0)
+                combined_mask = torch.cat([txt_mask, visual_prompt_mask], dim=1)
+
+                # Use combined prompt instead of geometric prompt
+                prompt, prompt_mask, backbone_out = self.processor.model._encode_prompt(
+                    backbone_out=state["backbone_out"],
+                    find_input=self.processor.find_stage,
+                    geometric_prompt=None,
+                    encode_text=False,  # Text already encoded
+                    skip_coords=skip_coords
+                )
+
+                # Override with our combined prompt
+                prompt = combined_prompt
+                prompt_mask = combined_mask
+            else:
+                # Standard path: use dummy geometric prompt
+                state["geometric_prompt"] = self.processor.model._get_dummy_prompt()
+
+                prompt, prompt_mask, backbone_out = self.processor.model._encode_prompt(
+                    backbone_out=state["backbone_out"],
+                    find_input=self.processor.find_stage,
+                    geometric_prompt=state["geometric_prompt"],
+                    encode_text=True,
+                    skip_coords=skip_coords
+                )
+
             backbone_out, encoder_out, _ = self.processor.model._run_encoder(
                 backbone_out, self.processor.find_stage, prompt, prompt_mask
             )
-            
+
             feat = encoder_out["encoder_hidden_states"].squeeze(1).float()
             feat = F.normalize(feat, dim=1, p=2)
             all_feats.append(feat)
@@ -102,21 +128,27 @@ class MatcherBoxCalculator():
         out_feats = torch.cat(all_feats, dim=0)
         return out_feats
 
-    def compute_box(self, reference_image=None, target_image=None, reference_mask=None, text_prompt="visual", use_fused_matcher_features=False, skip_coords=False):
+    def compute_box(self, reference_image=None, target_image=None, reference_mask=None, text_prompt="visual", use_fused_matcher_features=False, skip_coords=False, use_query_self_matching=False, reference_visual_prompt=None, reference_visual_mask=None):
         if reference_image is None or target_image is None:
             raise ValueError("Reference or Target image is not specified")
-        
+
+        # Validation for query self-matching mode
+        if use_query_self_matching:
+            if not use_fused_matcher_features:
+                raise ValueError("Query self-matching requires use_fused_matcher_features=True")
+            if reference_visual_prompt is None or reference_visual_mask is None:
+                raise ValueError("Query self-matching requires reference_visual_prompt and reference_visual_mask")
 
         if reference_mask is None:
             reference_mask = torch.ones((self.resolution, self.resolution), device=self.device)
         elif not isinstance(reference_mask, torch.Tensor):
             reference_mask = torch.from_numpy(np.array(reference_mask)).to(self.device).float()
-        
+
         if reference_mask.ndim == 2:
             reference_mask = reference_mask.unsqueeze(0).unsqueeze(0)
         elif reference_mask.ndim == 3:
             reference_mask = reference_mask.unsqueeze(0)
-            
+
         if reference_mask.shape[-2:] != (self.resolution, self.resolution):
             reference_mask = F.interpolate(reference_mask, size=(self.resolution, self.resolution), mode='nearest')
         print(f"[MatcherBoxCalculator] Reference Mask Shape: {reference_mask.shape}")
@@ -130,10 +162,29 @@ class MatcherBoxCalculator():
         print(f"[MatcherBoxCalculator] Pooled Mask Grid Shape: {ref_masks_pool_grid.shape}")
         self.ref_masks_pool = (ref_masks_pool_grid > 0.01).float().reshape(-1)
 
-        if use_fused_matcher_features:
+        if use_query_self_matching:
+            # Query self-matching mode: both features come from target_image
+            # Reference features: target_image + support visual embeddings + text
+            # Target features: target_image + text only
+            print("[MatcherBoxCalculator] Using query self-matching mode")
+            ref_features = self.get_fused_image_features(
+                target_image,
+                text_prompt,
+                skip_coords,
+                visual_prompt=reference_visual_prompt,
+                visual_prompt_mask=reference_visual_mask
+            )
+            target_features = self.get_fused_image_features(
+                target_image,
+                text_prompt,
+                skip_coords
+            )
+        elif use_fused_matcher_features:
+            # Standard fused features mode
             ref_features = self.get_fused_image_features(reference_image, text_prompt, skip_coords)
             target_features = self.get_fused_image_features(target_image, text_prompt, skip_coords)
         else:
+            # Backbone features mode
             ref_features = self.get_image_features(reference_image)
             target_features = self.get_image_features(target_image)
 

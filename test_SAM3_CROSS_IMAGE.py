@@ -19,6 +19,9 @@ from MatcherBoxCalculator import MatcherBoxCalculator
 from PatchCoreSampler import GreedyCoresetSampler
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
+from sklearn_extra.cluster import KMedoids
+from sklearn.cluster import KMeans
+from sklearn.metrics import pairwise_distances
 import matplotlib.pyplot as plt
 
 def fix_randseed(seed):
@@ -41,6 +44,16 @@ def validate_args(args):
     if args.frame_num <= 0:
         raise Exception("--frame_num must be > 0")
 
+    # Validation rules for query self-matching
+    if args.use_query_self_matching and not args.matcher_points:
+        raise Exception("To use --use_query_self_matching --matcher_points must be enabled")
+    if args.use_query_self_matching and not args.use_fused_matcher_features:
+        raise Exception("To use --use_query_self_matching --use_fused_matcher_features must be enabled (requires fusion encoder)")
+    if args.use_query_self_matching and args.use_query_as_support:
+        raise Exception("--use_query_self_matching is incompatible with --use_query_as_support")
+    if args.use_query_self_matching and (not args.nshot > 0):
+        raise Exception("To use --use_query_self_matching --nshot must be > 0 (need support images to extract embeddings)")
+
 
 def get_arguments():
         parser = argparse.ArgumentParser(description='FSVOS')
@@ -61,10 +74,11 @@ def get_arguments():
         parser.add_argument("--run_n", type=int, default=0)
         parser.add_argument("--skip_coords", action="store_true", default=False, help="Skip coordinate-based embeddings when generating prompt tokens from support images")
         parser.add_argument("--use_fused_matcher_features", action="store_true", default=False, help="Use fused features from the fusion encoder instead of native PE backbone features for matcher.")
+        parser.add_argument("--use_query_self_matching", action="store_true", default=False, help="Use query self-matching: compute matcher points between query features with/without support embeddings")
         parser.add_argument("--num_points_from_mask", type=int, default=20)
         parser.add_argument("--use_query_as_support", action="store_true", default=False, help="Use the query image as support image (only for 1-shot)")
         parser.add_argument("--disable_text", action="store_true", default=False, help="Disable text prompts")
-        parser.add_argument("--sampling", type=str, default="random", choices=["random", "top-k", "patch-core"], help="Sampling strategy for Matcher points")
+        parser.add_argument("--sampling", type=str, default="random", choices=["random", "top-k", "patch-core", "k-means-embeddings", "k-means-points", "k-medoids-embeddings", "k-medoids-points"], help="Sampling strategy for Matcher points")
         parser.add_argument("--visualize_embeddings", action="store_true", default=False, help="Generate t-SNE plots of the embeddings")
         # Random state management
         parser.add_argument('--seed', type=int, default=0)
@@ -359,7 +373,7 @@ def plot_embeddings_tsne(all_features, matched_indices, sampled_indices, output_
     features_pca = pca.fit_transform(features_np)
     
     # 2. t-SNE
-    tsne = TSNE(n_components=2, perplexity=30, max_iter=1000, random_state=0)
+    tsne = TSNE(n_components=2, perplexity=30, max_iter=300, random_state=0)
     features_2d = tsne.fit_transform(features_pca)
     
     # 3. Plot
@@ -419,25 +433,57 @@ def get_points_from_matcher(support_imgs=None, support_masks=None, query_img=Non
     all_pts_norm[:, 0] /= res
     all_pts_norm[:, 1] /= res
 
-    # Subsample or slice based on ordered flag
+    # Subsample only if more points than requested are returned by matcher
     if len(all_pts_norm) > num_points:
         if sampling == "patch-core":
             sampler = GreedyCoresetSampler(device=matched_features.device, n_samples=num_points)
             sampled_features, sampled_indices = sampler.run(matched_features)
             pts_norm_sampled = all_pts_norm[sampled_indices][:, None, :]
-            
-            if visualize and len(points) >= 20 and visual_output_path:
-                plot_embeddings_tsne(all_target_features, matched_indices_in_all, sampled_indices, visual_output_path)
 
         elif sampling == "top-k":
             # Top-K
             pts_norm_sampled = all_pts_norm[:num_points][:, None, :]
+            sampled_indices = np.arange(num_points)
         elif sampling == "random":
             # Random
             indices = np.random.choice(len(all_pts_norm), num_points, replace=False)
             pts_norm_sampled = all_pts_norm[indices][:, None, :]  # [N, 1, 2] for SAM3
+            sampled_indices = indices
+        elif sampling == "k-means-embeddings":
+            
+            feat_np = matched_features.cpu().numpy()
+            kmeans = KMeans(n_clusters=num_points, random_state=0, n_init=10).fit(feat_np)
+            centers = kmeans.cluster_centers_
+            
+            dists = pairwise_distances(centers, feat_np)
+            sampled_indices = np.argmin(dists, axis=1)
+            pts_norm_sampled = all_pts_norm[sampled_indices][:, None, :]
+                
+        elif sampling == "k-means-points":
+            
+            kmeans = KMeans(n_clusters=num_points, random_state=0, n_init=10).fit(all_pts_norm)
+            centers = kmeans.cluster_centers_
+            
+            dists = pairwise_distances(centers, all_pts_norm)
+            sampled_indices = np.argmin(dists, axis=1)
+            pts_norm_sampled = all_pts_norm[sampled_indices][:, None, :]
+                
+        elif sampling == "k-medoids-embeddings":
+            feat_np = matched_features.cpu().numpy()
+            kmedoids = KMedoids(n_clusters=num_points, random_state=0, init='k-medoids++').fit(feat_np)
+            sampled_indices = kmedoids.medoid_indices_
+            pts_norm_sampled = all_pts_norm[sampled_indices][:, None, :]
+
+        elif sampling == "k-medoids-points":
+            kmedoids = KMedoids(n_clusters=num_points, random_state=0, init='k-medoids++').fit(all_pts_norm)
+            sampled_indices = kmedoids.medoid_indices_
+            pts_norm_sampled = all_pts_norm[sampled_indices][:, None, :]
     else:
         pts_norm_sampled = all_pts_norm[:, None, :]
+        sampled_indices = np.arange(len(all_pts_norm))
+
+    if visualize and len(points) >= 30 and visual_output_path:
+        plot_embeddings_tsne(all_target_features, matched_indices_in_all, sampled_indices, visual_output_path)
 
     # Normalize box
     norm_box = None
@@ -445,31 +491,161 @@ def get_points_from_matcher(support_imgs=None, support_masks=None, query_img=Non
         norm_box = [box[0] / res, box[1] / res, box[2] / res, box[3] / res]
 
     return pts_norm_sampled, all_pts_norm, norm_box
-    
 
-def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_masks=None, query_img=None, skip_coords=False, num_points=20, use_matcher_points=False, matcher_calculator=None, text_prompt="visual", use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None):
+# Helper function to encode point prompts (reused in get_prompt_tokens_from_support and get_query_self_matching_points)
+def encode_pts_prompts(processor, image, pts, skip_coords):
+    state = processor.set_image(image)
+    state = processor.add_point_prompts(pts, [True]*len(pts), state)
+    state = processor._encode_current_prompts(state, encode_text=False, skip_coords=skip_coords)
+    return state
+
+def get_query_self_matching_points(processor=None, support_imgs=None, support_masks=None, query_img=None, num_points=20, matcher_calculator=None, text_prompt="visual", skip_coords=False, sampling="random", visualize=False, visual_output_path=None):
+    """
+    Query self-matching: compute matcher points between two feature volumes of the query image.
+    Reference features: query + support embeddings + text
+    Target features: query + text only
+
+    Returns all data in normalized [0,1] coordinates:
+      - pts_norm_sampled: [N, 1, 2] normalized sampled points (for SAM3)
+      - all_pts_norm:     [M, 2]    normalized full point set
+      - norm_box:         [4]       normalized box [x1, y1, x2, y2] or None
+    """
     if processor is None:
         raise Exception("Processor is not specified")
     if support_imgs is None:
         raise Exception("Support images are not specified")
     if support_masks is None:
         raise Exception("Support masks are not specified")
-    if query_img is None and use_matcher_points:
-        raise Exception("Query image is not specified when use_matcher_points is True")
-    if matcher_calculator is None and use_matcher_points:
-        raise Exception("Matcher calculator is required when use_matcher_points is True")
-    
-    def encode_pts_prompts(processor, image, pts, skip_coords):
-        # print(f"points have shape {pts.shape}")
-        state = processor.set_image(image)
-        state = processor.add_point_prompts(pts, [True]*len(pts), state)
-        # don't encode the text prompts
-        state = processor._encode_current_prompts(state, encode_text=False, skip_coords=skip_coords)
-        return state
-        
+    if query_img is None:
+        raise Exception("Query image is not specified")
+    if matcher_calculator is None:
+        raise Exception("Matcher calculator is not specified")
+
+    # Step 1: Extract visual embeddings from support images (random points from masks)
     all_visual_tokens = []
     all_visual_masks = []
-    
+
+    assert support_imgs.shape[0] == support_masks.shape[0]
+
+    for idx in range(support_imgs.shape[0]):
+        support_img = support_imgs[idx]
+        support_mask = support_masks[idx]
+
+        pts_norm, pts_actual = get_random_points_from_mask(mask=support_mask, num_points=num_points)
+        if pts_norm is None:
+            raise Exception(f"Mask for support image {idx} is empty. No points have been returned.")
+
+        state = encode_pts_prompts(processor, support_img, pts_norm, skip_coords)
+        all_visual_tokens.append(state["prompt"])
+        all_visual_masks.append(state["prompt_mask"])
+
+    if not all_visual_tokens:
+        raise ValueError("No valid support shots found.")
+
+    # Aggregate visual knowledge from support
+    aggregated_visual_prompt = torch.cat(all_visual_tokens, dim=0)
+    aggregated_visual_mask = torch.cat(all_visual_masks, dim=1)
+
+    # Step 2: Call matcher with query self-matching mode
+    # We pass the query image as target_image and use a dummy reference_mask (all ones)
+    # The reference_mask is used to pool features, but in self-matching we care about query features
+    dummy_reference_mask = torch.ones((1008, 1008), device=query_img.device)
+
+    box, points, matched_features, all_target_features, matched_indices_in_all = matcher_calculator.compute_box(
+        reference_image=query_img,  # Not used in query self-matching, but required for API
+        target_image=query_img,
+        reference_mask=dummy_reference_mask,
+        text_prompt=text_prompt,
+        use_fused_matcher_features=True,  # Required for query self-matching
+        skip_coords=skip_coords,
+        use_query_self_matching=True,
+        reference_visual_prompt=aggregated_visual_prompt,
+        reference_visual_mask=aggregated_visual_mask
+    )
+
+    if len(points) == 0:
+        print("[WARNING] - Query self-matching returned 0 points.")
+        return None, None, None
+
+    res = float(matcher_calculator.resolution)
+
+    # Normalize all points to [0,1]
+    all_pts_norm = points.astype(np.float64).copy()
+    all_pts_norm[:, 0] /= res
+    all_pts_norm[:, 1] /= res
+
+    # Subsample only if more points than requested are returned by matcher
+    if len(all_pts_norm) > num_points:
+        if sampling == "patch-core":
+            sampler = GreedyCoresetSampler(device=matched_features.device, n_samples=num_points)
+            sampled_features, sampled_indices = sampler.run(matched_features)
+            pts_norm_sampled = all_pts_norm[sampled_indices][:, None, :]
+
+        elif sampling == "top-k":
+            pts_norm_sampled = all_pts_norm[:num_points][:, None, :]
+            sampled_indices = np.arange(num_points)
+
+        elif sampling == "random":
+            indices = np.random.choice(len(all_pts_norm), num_points, replace=False)
+            pts_norm_sampled = all_pts_norm[indices][:, None, :]
+            sampled_indices = indices
+
+        elif sampling == "k-means-embeddings":
+            feat_np = matched_features.cpu().numpy()
+            kmeans = KMeans(n_clusters=num_points, random_state=0, n_init=10).fit(feat_np)
+            centers = kmeans.cluster_centers_
+
+            dists = pairwise_distances(centers, feat_np)
+            sampled_indices = np.argmin(dists, axis=1)
+            pts_norm_sampled = all_pts_norm[sampled_indices][:, None, :]
+
+        elif sampling == "k-means-points":
+            kmeans = KMeans(n_clusters=num_points, random_state=0, n_init=10).fit(all_pts_norm)
+            centers = kmeans.cluster_centers_
+
+            dists = pairwise_distances(centers, all_pts_norm)
+            sampled_indices = np.argmin(dists, axis=1)
+            pts_norm_sampled = all_pts_norm[sampled_indices][:, None, :]
+
+        elif sampling == "k-medoids-embeddings":
+            feat_np = matched_features.cpu().numpy()
+            kmedoids = KMedoids(n_clusters=num_points, random_state=0, init='k-medoids++').fit(feat_np)
+            sampled_indices = kmedoids.medoid_indices_
+            pts_norm_sampled = all_pts_norm[sampled_indices][:, None, :]
+
+        elif sampling == "k-medoids-points":
+            kmedoids = KMedoids(n_clusters=num_points, random_state=0, init='k-medoids++').fit(all_pts_norm)
+            sampled_indices = kmedoids.medoid_indices_
+            pts_norm_sampled = all_pts_norm[sampled_indices][:, None, :]
+    else:
+        pts_norm_sampled = all_pts_norm[:, None, :]
+        sampled_indices = np.arange(len(all_pts_norm))
+
+    if visualize and len(points) >= 30 and visual_output_path:
+        plot_embeddings_tsne(all_target_features, matched_indices_in_all, sampled_indices, visual_output_path)
+
+    # Normalize box
+    norm_box = None
+    if box is not None:
+        norm_box = [box[0] / res, box[1] / res, box[2] / res, box[3] / res]
+
+    return pts_norm_sampled, all_pts_norm, norm_box
+
+def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_masks=None, query_img=None, skip_coords=False, num_points=20, use_matcher_points=False, matcher_calculator=None, text_prompt="visual", use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, use_query_self_matching=False):
+    if processor is None:
+        raise Exception("Processor is not specified")
+    if support_imgs is None:
+        raise Exception("Support images are not specified")
+    if support_masks is None:
+        raise Exception("Support masks are not specified")
+    if query_img is None and (use_matcher_points or use_query_self_matching):
+        raise Exception("Query image is not specified when use_matcher_points or use_query_self_matching is True")
+    if matcher_calculator is None and (use_matcher_points or use_query_self_matching):
+        raise Exception("Matcher calculator is required when use_matcher_points or use_query_self_matching is True")
+
+    all_visual_tokens = []
+    all_visual_masks = []
+
     assert support_imgs.shape[0] == support_masks.shape[0]
 
     # All point/box data returned is in normalized [0,1] coordinates
@@ -478,7 +654,30 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
     norm_box = None
     actual_pts_sampled = None
 
-    if use_matcher_points:
+    if use_query_self_matching:
+        # Query self-matching mode: get points from matching query features
+        pts_norm, all_pts_norm, box_norm = get_query_self_matching_points(
+            processor=processor,
+            support_imgs=support_imgs,
+            support_masks=support_masks,
+            query_img=query_img,
+            num_points=num_points,
+            matcher_calculator=matcher_calculator,
+            text_prompt=text_prompt,
+            skip_coords=skip_coords,
+            sampling=sampling,
+            visualize=visualize,
+            visual_output_path=visual_output_path
+        )
+        if pts_norm is not None:
+            state = encode_pts_prompts(processor, query_img, pts_norm, skip_coords)
+            all_visual_tokens.append(state["prompt"])
+            all_visual_masks.append(state["prompt_mask"])
+            norm_pts_sampled = pts_norm
+            all_norm_pts = all_pts_norm
+            norm_box = box_norm
+    elif use_matcher_points:
+        # Standard matcher mode: get points from support-to-query matching
         pts_norm, all_pts_norm, box_norm = get_points_from_matcher(support_imgs=support_imgs, support_masks=support_masks, query_img=query_img, num_points=num_points, matcher_calculator=matcher_calculator, text_prompt=text_prompt, use_fused_matcher_features=use_fused_matcher_features, skip_coords=skip_coords, sampling=sampling, visualize=visualize, visual_output_path=visual_output_path)
         if pts_norm is not None:
             state = encode_pts_prompts(processor, query_img, pts_norm, skip_coords)
@@ -549,7 +748,7 @@ def update_state_with_support_prompt(state=None, prompt=None, prompt_mask=None, 
     
     return state
 
-def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, support_masks=None, text_prompt="visual", skip_coords=False, num_points=20, use_matcher_points=False, matcher_calculator=None, use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None):
+def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, support_masks=None, text_prompt="visual", skip_coords=False, num_points=20, use_matcher_points=False, matcher_calculator=None, use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, use_query_self_matching=False):
     if sam3 is None:
         raise Exception("SAM3 is not specified")
     elif query_frame is None:
@@ -562,8 +761,8 @@ def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, suppo
         raise Exception("Matcher calculator is required when use_matcher_points is True")
     
     visual_prompt, visual_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled = get_prompt_tokens_from_support(
-        processor=sam3.processor, 
-        support_imgs=support_imgs, 
+        processor=sam3.processor,
+        support_imgs=support_imgs,
         support_masks=support_masks,
         query_img=query_frame,
         skip_coords=skip_coords,
@@ -574,7 +773,8 @@ def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, suppo
         use_fused_matcher_features=use_fused_matcher_features,
         sampling=sampling,
         visualize=visualize,
-        visual_output_path=visual_output_path
+        visual_output_path=visual_output_path,
+        use_query_self_matching=use_query_self_matching
     )
     final_prompt, final_mask, text_outputs = aggregate_prompt_with_text_tokens(
         processor=sam3.processor, 
@@ -746,7 +946,8 @@ def main():
                             use_fused_matcher_features=args.use_fused_matcher_features,
                             sampling=args.sampling,
                             visualize=args.visualize_embeddings,
-                            visual_output_path=os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}_tsne.png") if args.visualize_embeddings and args.matcher_points else None
+                            visual_output_path=os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}_tsne.png") if args.visualize_embeddings and args.matcher_points else None,
+                            use_query_self_matching=args.use_query_self_matching
                         )
                     else:
                         prediction, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled = cross_image_prediction(
@@ -772,7 +973,7 @@ def main():
                     pixel_size = (actual_w, actual_h)
 
                     # Single rescale from [0,1] → pixels, only when we have query-side points
-                    has_query_pts = args.matcher_points or args.use_query_as_support
+                    has_query_pts = args.matcher_points or args.use_query_as_support or args.use_query_self_matching
                     
                     # Use actual points if available (from mask), otherwise rescale normalized points (from matcher)
                     if actual_pts_sampled is not None:
