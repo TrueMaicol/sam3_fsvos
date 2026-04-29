@@ -45,6 +45,9 @@ class MatcherBoxCalculator():
         self.number_support_patches_backward_matching = None
         self.number_query_patches_backward_matching = None
     
+    def _get_encoder_layers(self):
+        return self.processor.model.transformer.encoder.layers
+
     def get_image_features(self, image):
         image = v2.functional.to_image(image)
         
@@ -69,14 +72,18 @@ class MatcherBoxCalculator():
         
         return feats
 
-    def get_fused_image_features(self, image, text_prompt="visual", skip_coords=False, visual_prompt=None, visual_prompt_mask=None):
+    def get_fused_image_features(self, image, text_prompt="visual", skip_coords=False,
+                                  visual_prompt=None, visual_prompt_mask=None,
+                                  return_attn_weights=False, attn_prior_layers="last"):
         if self.processor is None:
             raise ValueError("sam3_processor must be provided to use fused features")
 
         if image.ndim == 3:
             image = image.unsqueeze(0)
 
+        print(f"[FusedFeatures] images={image.shape[0]} | text='{text_prompt}' | visual_prompt={'yes' if visual_prompt is not None else 'no'} | skip_coords={skip_coords}")
         all_feats = []
+        all_attn_maps = []
         for img in image:
             state = self.processor.set_image(img)
             text_outputs = self.processor.model.backbone.forward_text([text_prompt], device=self.processor.device)
@@ -93,18 +100,10 @@ class MatcherBoxCalculator():
                 combined_prompt = torch.cat([txt_tokens, visual_prompt], dim=0)
                 combined_mask = torch.cat([txt_mask, visual_prompt_mask], dim=1)
 
-                # Use combined prompt instead of geometric prompt
-                prompt, prompt_mask, backbone_out = self.processor.model._encode_prompt(
-                    backbone_out=state["backbone_out"],
-                    find_input=self.processor.find_stage,
-                    geometric_prompt=None,
-                    encode_text=False,  # Text already encoded
-                    skip_coords=skip_coords
-                )
-
                 # Override with our combined prompt
                 prompt = combined_prompt
                 prompt_mask = combined_mask
+                backbone_out = state["backbone_out"]
             else:
                 # Standard path: use dummy geometric prompt
                 state["geometric_prompt"] = self.processor.model._get_dummy_prompt()
@@ -117,18 +116,55 @@ class MatcherBoxCalculator():
                     skip_coords=skip_coords
                 )
 
+            # Enable attention weight capture on target layers if requested
+            target_layers = []
+            if return_attn_weights:
+                all_layers = self._get_encoder_layers()
+                target_layers = [all_layers[-1]] if attn_prior_layers == "last" else list(all_layers)
+                for layer in target_layers:
+                    layer.capture_cross_attn_weights = True
+
             backbone_out, encoder_out, _ = self.processor.model._run_encoder(
                 backbone_out, self.processor.find_stage, prompt, prompt_mask
             )
+
+            # Collect and aggregate attention weights, then clean up
+            if return_attn_weights:
+                # Determine number of text tokens to isolate visual attention
+                num_text_tokens = text_outputs["language_features"].shape[0] if "language_features" in text_outputs else 0
+                
+                layer_maps = []
+                for layer in target_layers:
+                    if layer.last_cross_attn_weights is not None:
+                        if visual_prompt is not None:
+                            # Sum only the attention weights corresponding to the visual prompt tokens
+                            # shape: [batch, 5184, seq_prompt] -> slice [..., num_text_tokens:] -> [batch, 5184]
+                            attn_to_visual = layer.last_cross_attn_weights[..., num_text_tokens:].sum(dim=-1)
+                            layer_maps.append(attn_to_visual)
+                        else:
+                            # Fallback if no visual prompt
+                            layer_maps.append(layer.last_cross_attn_weights.max(dim=-1)[0])
+                    layer.capture_cross_attn_weights = False
+                    layer.last_cross_attn_weights = None
+                if layer_maps:
+                    # mean over layers → [batch, 5184] → [5184]
+                    attn_map = torch.stack(layer_maps, dim=0).mean(dim=0).squeeze(0)
+                    all_attn_maps.append(attn_map)
 
             feat = encoder_out["encoder_hidden_states"].squeeze(1).float()
             feat = F.normalize(feat, dim=1, p=2)
             all_feats.append(feat)
 
         out_feats = torch.cat(all_feats, dim=0)
+        print(f"[FusedFeatures] output shape: {out_feats.shape}")
+
+        if return_attn_weights:
+            # Return mean attention map across images (typically just one image)
+            attn_map_out = torch.stack(all_attn_maps, dim=0).mean(dim=0) if all_attn_maps else None
+            return out_feats, attn_map_out
         return out_feats
 
-    def compute_box(self, reference_image=None, target_image=None, reference_mask=None, text_prompt="visual", use_fused_matcher_features=False, skip_coords=False, use_query_self_matching=False, reference_visual_prompt=None, reference_visual_mask=None):
+    def compute_box(self, reference_image=None, target_image=None, reference_mask=None, text_prompt="visual", use_fused_matcher_features=False, skip_coords=False, use_query_self_matching=False, reference_visual_prompt=None, reference_visual_mask=None, use_attn_prior_rerank=False, attn_prior_layers="last"):
         if reference_image is None or target_image is None:
             raise ValueError("Reference or Target image is not specified")
 
@@ -195,6 +231,29 @@ class MatcherBoxCalculator():
         matched_features = results[7]
         all_target_features = results[8]
         matched_indices_in_all = results[9]
+
+        # Rerank matched points by cross-attention localization prior
+        if use_attn_prior_rerank and len(points) > 0:
+            _, attn_map = self.get_fused_image_features(
+                target_image,
+                text_prompt=text_prompt,
+                visual_prompt=reference_visual_prompt,
+                visual_prompt_mask=reference_visual_mask,
+                return_attn_weights=True,
+                attn_prior_layers=attn_prior_layers,
+            )
+            H = W = self.encoder_feat_size  # 72
+            pts_arr = np.array(points)
+            px = (pts_arr[:, 0] / self.encoder_patch_size).astype(int).clip(0, W - 1)
+            py = (pts_arr[:, 1] / self.encoder_patch_size).astype(int).clip(0, H - 1)
+            patch_idx = py * W + px
+            attn_scores = attn_map[patch_idx].cpu().numpy()
+            order = np.argsort(attn_scores)[::-1]
+            points = pts_arr[order]
+            matched_features = matched_features[order]
+            matched_indices_in_all = matched_indices_in_all[order]
+            print(f"[AttnRerank] reranked {len(points)} points by cross-attention prior")
+
         return box, points, matched_features, all_target_features, matched_indices_in_all
 
     def patch_level_matching(self, ref_feats, tar_feat):
@@ -225,6 +284,7 @@ class MatcherBoxCalculator():
             index, dtype=torch.int64, device=self.device) for index in indices_forward]
         self.number_support_patches_forward_matching = len(indices_forward[0])
         self.number_query_patches_forward_matching = len(indices_forward[1])
+        print(f"[PatchMatching] forward: {number_support_patches} support patches → {len(indices_forward[1])} query matches")
         # sim_scores_f = T, i.e. the similarity scores of the matched patches.
         sim_scores_f = self.S_forward[indices_forward[0], indices_forward[1]]
         self.sim_scores_after_forward_matching = sim_scores_f
@@ -273,6 +333,7 @@ class MatcherBoxCalculator():
         # if there are more than 40 matched points, we keep only half of them.
         reduced_points_num = len(
             sim_matched) // 2 if len(sim_matched) > 40 else len(sim_matched)
+        print(f"[PatchMatching] backward: {self.number_support_patches_backward_matching} retained | reduced to {reduced_points_num}")
         sim_sorted, sim_idx_sorted = torch.sort(sim_matched, descending=True)
         sim_filter = sim_idx_sorted[:reduced_points_num]
         points_matched_inds = indices_forward_pos[1][sim_filter]
@@ -362,6 +423,7 @@ class MatcherBoxCalculator():
         else:
             box = None
 
+        print(f"[PatchMatching] final: {len(ponits)} matched points ({len(points_discarded)} discarded)")
         return ponits, negative_priors if len(negative_priors) > 0 else points_discarded, box, self.S, C, reduced_points_num, reduced_points_num_neg, matched_features, self.tar_feat, points_matched_inds_set[keep_indices]
 
     def sample_negative_points_from_discarded(self, idxs_forward, sim_scores_forward, idxs_reverse, idxs_mask):

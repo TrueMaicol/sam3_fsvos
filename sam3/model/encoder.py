@@ -80,6 +80,8 @@ class TransformerEncoderLayer(nn.Module):
         self.pos_enc_at_cross_attn_keys = pos_enc_at_cross_attn_keys
 
         self.layer_idx = None
+        self.capture_cross_attn_weights = False
+        self.last_cross_attn_weights = None
 
     def forward_post(
         self,
@@ -122,13 +124,26 @@ class TransformerEncoderLayer(nn.Module):
         tgt = self.norm1(tgt)
 
         # Cross attention to image
-        tgt2 = self.cross_attn_image(
-            query=tgt + query_pos if self.pos_enc_at_cross_attn_queries else tgt,
-            key=memory + pos if self.pos_enc_at_cross_attn_keys else memory,
-            value=memory,
-            attn_mask=memory_mask,
-            key_padding_mask=memory_key_padding_mask,
-        )[0]
+        if self.capture_cross_attn_weights:
+            attn_out, attn_w = self.cross_attn_image(
+                query=tgt + query_pos if self.pos_enc_at_cross_attn_queries else tgt,
+                key=memory + pos if self.pos_enc_at_cross_attn_keys else memory,
+                value=memory,
+                attn_mask=memory_mask,
+                key_padding_mask=memory_key_padding_mask,
+                need_weights=True,
+                average_attn_weights=True,
+            )
+            self.last_cross_attn_weights = attn_w.detach()
+            tgt2 = attn_out
+        else:
+            tgt2 = self.cross_attn_image(
+                query=tgt + query_pos if self.pos_enc_at_cross_attn_queries else tgt,
+                key=memory + pos if self.pos_enc_at_cross_attn_keys else memory,
+                value=memory,
+                attn_mask=memory_mask,
+                key_padding_mask=memory_key_padding_mask,
+            )[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
 
@@ -188,14 +203,27 @@ class TransformerEncoderLayer(nn.Module):
             # Recombine
             tgt = torch.cat((tgt, other_tgt), dim=0)
         tgt2 = self.norm2(tgt)
-        tgt2 = self.cross_attn_image(
-            query=tgt2 + query_pos if self.pos_enc_at_cross_attn_queries else tgt2,
-            key=memory + pos if self.pos_enc_at_cross_attn_keys else memory,
-            value=memory,
-            attn_mask=memory_mask,
-            key_padding_mask=memory_key_padding_mask,
-            # attn_bias=attn_bias,
-        )[0]
+        if self.capture_cross_attn_weights:
+            attn_out, attn_w = self.cross_attn_image(
+                query=tgt2 + query_pos if self.pos_enc_at_cross_attn_queries else tgt2,
+                key=memory + pos if self.pos_enc_at_cross_attn_keys else memory,
+                value=memory,
+                attn_mask=memory_mask,
+                key_padding_mask=memory_key_padding_mask,
+                need_weights=True,
+                average_attn_weights=True,
+            )
+            self.last_cross_attn_weights = attn_w.detach()
+            tgt2 = attn_out
+        else:
+            tgt2 = self.cross_attn_image(
+                query=tgt2 + query_pos if self.pos_enc_at_cross_attn_queries else tgt2,
+                key=memory + pos if self.pos_enc_at_cross_attn_keys else memory,
+                value=memory,
+                attn_mask=memory_mask,
+                key_padding_mask=memory_key_padding_mask,
+                # attn_bias=attn_bias,
+            )[0]
         tgt = tgt + self.dropout2(tgt2)
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
