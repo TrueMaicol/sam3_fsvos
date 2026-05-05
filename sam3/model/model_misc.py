@@ -116,6 +116,7 @@ def multi_head_attention_forward(
     attn_sparsity: float = 0.0,
     attn_bias: Optional[Tensor] = None,
     use_fa3: bool = False,
+    return_pre_softmax: bool = False,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     tens_ops = (
         query,
@@ -404,6 +405,7 @@ def multi_head_attention_forward(
     elif attn_type == AttentionType.Xformer:
         attn_output_weights = None
         assert not need_weights, "need_weights is not supported in efficient mode"
+        assert not return_pre_softmax, "return_pre_softmax is not supported in efficient mode"
         attn_output = xformers.ops.memory_efficient_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -415,6 +417,7 @@ def multi_head_attention_forward(
     elif attn_type == AttentionType.Sparse:
         attn_output_weights = None
         assert not need_weights, "need_weights is not supported in efficient mode"
+        assert not return_pre_softmax, "return_pre_softmax is not supported in efficient mode"
         # Need to collapse heads and batch dimensions
         q = q.reshape(bsz * num_heads, tgt_len, head_dim).contiguous()
         k = k.reshape(bsz * num_heads, src_len, head_dim).contiguous()
@@ -432,9 +435,10 @@ def multi_head_attention_forward(
     attn_output = F.linear(attn_output, out_proj_weight, out_proj_bias)
     attn_output = attn_output.view(tgt_len, bsz, attn_output.size(1))
 
-    if need_weights:
+    if need_weights or return_pre_softmax:
         attn_output_weights = (q * head_dim**-0.5) @ k.transpose(-2, -1)
-        attn_output_weights = attn_output_weights.softmax(dim=-1)
+        if not return_pre_softmax:
+            attn_output_weights = attn_output_weights.softmax(dim=-1)
         attn_output_weights = attn_output_weights.view(bsz, num_heads, tgt_len, src_len)
         if average_attn_weights:
             attn_output_weights = attn_output_weights.sum(dim=1) / num_heads
@@ -568,6 +572,7 @@ class MultiheadAttention(nn.Module):
         attn_mask: Optional[Tensor] = None,
         average_attn_weights: bool = True,
         attn_bias: Optional[Tensor] = None,
+        return_pre_softmax: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         is_batched = query.dim() == 3
         if key_padding_mask is not None:
@@ -620,6 +625,7 @@ class MultiheadAttention(nn.Module):
                     attn_sparsity=self.sparsity,
                     attn_bias=attn_bias,
                     use_fa3=self.use_fa3,
+                    return_pre_softmax=return_pre_softmax,
                 )
             else:
                 attn_output, attn_output_weights = multi_head_attention_forward(
@@ -649,6 +655,7 @@ class MultiheadAttention(nn.Module):
                     attn_sparsity=self.sparsity,
                     attn_bias=attn_bias,
                     use_fa3=self.use_fa3,
+                    return_pre_softmax=return_pre_softmax,
                 )
         else:
             if self.use_act_checkpoint:
@@ -676,6 +683,7 @@ class MultiheadAttention(nn.Module):
                     attn_type=self.attn_type,
                     attn_sparsity=self.sparsity,
                     attn_bias=attn_bias,
+                    return_pre_softmax=return_pre_softmax,
                 )
             else:
                 attn_output, attn_output_weights = multi_head_attention_forward(
@@ -700,6 +708,7 @@ class MultiheadAttention(nn.Module):
                     attn_type=self.attn_type,
                     attn_sparsity=self.sparsity,
                     attn_bias=attn_bias,
+                    return_pre_softmax=return_pre_softmax,
                 )
         if self.batch_first and is_batched:
             return attn_output.transpose(1, 0), attn_output_weights

@@ -36,31 +36,33 @@ def fix_randseed(seed):
     torch.backends.cudnn.deterministic = True
 
 def validate_args(args):
-    # Series of rules to match for the args
-    if args.matcher_points and (not args.nshot > 0):
-        raise Exception("To use --matcher_points --n_shot must be > 0, otherwise we don't have any reference image")
-    if args.matcher_points and args.use_query_as_support:
-        raise Exception("To use --matcher_points --use_query_as_support must be False")
+    em = args.experiment_mode
+
     if args.frame_num <= 0:
         raise Exception("--frame_num must be > 0")
 
-    # Validation rules for query self-matching
-    if args.use_query_self_matching and not args.matcher_points:
-        raise Exception("To use --use_query_self_matching --matcher_points must be enabled")
-    if args.use_query_self_matching and not args.use_fused_matcher_features:
-        raise Exception("To use --use_query_self_matching --use_fused_matcher_features must be enabled (requires fusion encoder)")
-    if args.use_query_self_matching and args.use_query_as_support:
-        raise Exception("--use_query_self_matching is incompatible with --use_query_as_support")
-    if args.use_query_self_matching and (not args.nshot > 0):
-        raise Exception("To use --use_query_self_matching --nshot must be > 0 (need support images to extract embeddings)")
+    if em in ("matcher", "self_matching", "dense_cross_attn"):
+        if not args.nshot > 0:
+            raise Exception(f"--experiment_mode={em} requires --nshot > 0")
 
-    # Validation rules for attention prior
-    if args.use_attn_prior and not args.use_fused_matcher_features:
-        raise Exception("--use_attn_prior requires --use_fused_matcher_features (needs the fusion encoder)")
-    if args.use_attn_prior and args.attn_prior_mode == "rerank_matcher" and not args.matcher_points:
-        raise Exception("--use_attn_prior with rerank_matcher mode requires --matcher_points")
-    if args.use_attn_prior and args.use_query_self_matching:
-        raise Exception("--use_attn_prior is incompatible with --use_query_self_matching")
+    if em in ("matcher", "self_matching"):
+        if args.use_query_as_support:
+            raise Exception(f"--experiment_mode={em} is incompatible with --use_query_as_support")
+
+    if em == "attn_prior" and args.attn_prior_mode == "rerank_matcher":
+        pass  # rerank handled internally via matcher_calculator
+
+    if em == "dense_cross_attn" and args.dense_cross_attn_mode == "rerank_matcher":
+        pass  # rerank handled internally via matcher_calculator
+
+    if em == "self_attn_bottomk":
+        if args.sampling_inputs == "support_only" and not args.nshot > 0:
+            raise Exception(
+                "--experiment_mode=self_attn_bottomk with --sampling_inputs=support_only requires --nshot > 0"
+            )
+
+    if args.sampling_inputs != "both" and em not in ("attn_prior", "self_attn_bottomk"):
+        raise Exception("--sampling_inputs only applies to --experiment_mode=attn_prior or self_attn_bottomk")
 
 
 def get_arguments():
@@ -78,14 +80,35 @@ def get_arguments():
         parser.add_argument("--synset_mapping_folder_path", type=str, default="/leonardo_work/IscrC_MARSv2/datasets/synset_mappings")
         parser.add_argument("--use_grouping_ade20k", action="store_true", default=False, help="Enable grouping of classes using JSON [ONLY ON ADE20K].")
         parser.add_argument("--all_lemmas", action="store_true", default=False, help="Iterate over all lemmas, instead of just the one selected inside the mapping")
-        parser.add_argument("--matcher_points", action="store_true", default=False, help="Use bipartite matching from matcher to get a set of points on the target image. Requires n_shot > 0")
+        parser.add_argument("--experiment_mode", type=str, default="random",
+            choices=["random", "matcher", "self_matching", "attn_prior", "dense_cross_attn", "self_attn_bottomk"],
+            help=(
+                "Experiment to run. "
+                "'random': random points from support masks (default). "
+                "'matcher': bipartite point matching support→query (requires --nshot > 0). "
+                "'self_matching': query self-matching with support embeddings, Exp 4. "
+                "'attn_prior': top-k from fusion encoder cross-attention map, Exp 5. "
+                "'dense_cross_attn': dense cross-attention to support foreground patches, Exp 6. "
+                "'self_attn_bottomk': bottom-k from fusion encoder self-attention map, Exp 7."
+            ))
+        parser.add_argument("--sampling_inputs", type=str, default="both",
+            choices=["both", "text_only", "support_only"],
+            help=(
+                "Controls what goes into the fusion encoder during the point-selection sampling pass. "
+                "Applies to attn_prior and self_attn_bottomk. "
+                "'both': text label + support visual prompts (default). "
+                "'text_only': text label only (no visual prompts). "
+                "'support_only': support visual prompts only (no text tokens in cross-attention)."
+            ))
         parser.add_argument("--run_n", type=int, default=0)
         parser.add_argument("--skip_coords", action="store_true", default=False, help="Skip coordinate-based embeddings when generating prompt tokens from support images")
-        parser.add_argument("--use_fused_matcher_features", action="store_true", default=False, help="Use fused features from the fusion encoder instead of native PE backbone features for matcher.")
-        parser.add_argument("--use_query_self_matching", action="store_true", default=False, help="Use query self-matching: compute matcher points between query features with/without support embeddings")
-        parser.add_argument("--use_attn_prior", action="store_true", default=False, help="Use fusion encoder cross-attention weights as a localization prior for point selection")
+        parser.add_argument("--use_fused_matcher_features", action="store_true", default=False, help="Use fused features from the fusion encoder instead of native PE backbone features for matcher (only relevant for experiment_mode=matcher).")
         parser.add_argument("--attn_prior_mode", type=str, default="topk_sampling", choices=["topk_sampling", "rerank_matcher"], help="topk_sampling: directly sample top-k patches by attention (no matcher); rerank_matcher: run matcher then reorder by attention")
-        parser.add_argument("--attn_prior_layers", type=str, default="last", choices=["last", "all"], help="Which fusion encoder layers to aggregate attention from: last layer only or mean over all 6")
+        parser.add_argument("--attn_layers", type=str, default="last", choices=["last", "all"], help="Which fusion encoder layers to aggregate attention from for both point selection and saving")
+        # Exp 6: Dense cross-attention sub-options
+        parser.add_argument("--dense_cross_attn_mode", type=str, default="topk_sampling", choices=["topk_sampling", "rerank_matcher"], help="topk_sampling: directly sample top-k patches from heatmap; rerank_matcher: rerank bipartite matcher candidates by heatmap score")
+        parser.add_argument("--dense_cross_attn_skip_text_injection", action="store_true", default=False, help="Exp 6: Skip the pooled-text→image-patch injection before the Fusion Encoder, so query features are purely visual during the dense cross-attention pass")
+        #
         parser.add_argument("--num_points_from_mask", type=int, default=20)
         parser.add_argument("--use_query_as_support", action="store_true", default=False, help="Use the query image as support image (only for 1-shot)")
         parser.add_argument("--disable_text", action="store_true", default=False, help="Disable text prompts")
@@ -113,26 +136,6 @@ def save_image_with_box(image, box, output_path):
         outline="red", 
         width=5
     )
-    res_image.save(output_path)
-
-def save_image_with_points(image, points, output_path):
-    """
-    Draws red points on the image and saves it.
-    Points are expected to be a list of (x, y) tuples.
-    """
-    res_image = Image.fromarray(image.copy())
-    draw = ImageDraw.Draw(res_image)
-    
-    if points is not None:
-        if points.ndim == 3:
-            points = points[:, 0, :]
-            
-        for (x, y) in points:
-            draw.ellipse(
-                [x-5, y-5, x+5, y+5], 
-                fill="red", 
-                outline="red"
-            )
     res_image.save(output_path)
 
 def save_image_with_all_and_sampled_points(image, all_points, sampled_points, output_path):
@@ -478,7 +481,7 @@ def _postprocess_matcher_output(box, points, matched_features, all_target_featur
     return pts_norm_sampled, all_pts_norm, norm_box
 
 
-def get_points_from_matcher(support_imgs=None, support_masks=None, query_img=None, num_points=20, matcher_calculator=None, text_prompt="visual", use_fused_matcher_features=False, skip_coords=False, sampling="random", visualize=False, visual_output_path=None, use_attn_prior_rerank=False, reference_visual_prompt=None, reference_visual_mask=None, attn_prior_layers="last"):
+def get_points_from_matcher(support_imgs=None, support_masks=None, query_img=None, num_points=20, matcher_calculator=None, text_prompt="visual", use_fused_matcher_features=False, skip_coords=False, sampling="random", visualize=False, visual_output_path=None, use_attn_prior_rerank=False, reference_visual_prompt=None, reference_visual_mask=None, attn_layers="last"):
     """
     Returns all data in normalized [0,1] coordinates:
       - pts_norm_sampled: [N, 1, 2] normalized sampled points (for SAM3)
@@ -505,7 +508,7 @@ def get_points_from_matcher(support_imgs=None, support_masks=None, query_img=Non
         use_attn_prior_rerank=use_attn_prior_rerank,
         reference_visual_prompt=reference_visual_prompt,
         reference_visual_mask=reference_visual_mask,
-        attn_prior_layers=attn_prior_layers,
+        attn_layers=attn_layers,
     )
     print(f"[Matcher] compute_box returned {len(points)} candidate points")
     if len(points) == 0:
@@ -601,51 +604,180 @@ def get_query_self_matching_points(processor=None, support_imgs=None, support_ma
         float(matcher_calculator.resolution), num_points, sampling, visualize, visual_output_path
     )
 
-def get_attn_prior_points(query_img, text_prompt, num_points, matcher_calculator, attn_prior_layers,
+def get_attn_prior_points(query_img, text_prompt, num_points, matcher_calculator, attn_layers,
                            visual_prompt=None, visual_prompt_mask=None):
     """
-    Sample num_points prompt points directly from the fusion encoder cross-attention map.
+    Sample num_points prompt points from the fusion encoder visual/points cross-attention map.
     Returns norm_pts [num_points, 2] in normalized (x, y) coords.
     Bypasses compute_box and _postprocess_matcher_output — attention ranking is the final selection.
     """
-    _, attn_map = matcher_calculator.get_fused_image_features(
+    matcher_calculator.get_fused_image_features(
         query_img,
         text_prompt=text_prompt,
         visual_prompt=visual_prompt,
         visual_prompt_mask=visual_prompt_mask,
-        return_attn_weights=True,
-        attn_prior_layers=attn_prior_layers,
+        attn_layers=attn_layers,
     )
+    # Point selection uses attention to visual/point tokens (not text)
+    pts_map = matcher_calculator.last_cross_attn_points_map  # [72, 72] numpy
     H = W = matcher_calculator.encoder_feat_size  # 72
     patch_size = matcher_calculator.encoder_patch_size  # 14
     resolution = float(matcher_calculator.resolution)  # 1008
 
-    topk_idx = torch.topk(attn_map, k=num_points).indices  # [num_points]
+    attn_flat = torch.from_numpy(pts_map).flatten()  # [5184]
+    topk_idx = torch.topk(attn_flat, k=num_points).indices  # [num_points]
     px = (topk_idx % W) * patch_size + patch_size // 2
     py = (topk_idx // W) * patch_size + patch_size // 2
     norm_pts = torch.stack([px.float() / resolution, py.float() / resolution], dim=1)
-    print(f"[AttnPrior] sampled {num_points} points from cross-attention map (layers={attn_prior_layers})")
-    return norm_pts.cpu().numpy(), attn_map.reshape(H, W).cpu().numpy()
+    print(f"[AttnPrior] sampled {num_points} points from cross-attention map (layers={attn_layers})")
+    return norm_pts.cpu().numpy()
 
 
-def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_masks=None, query_img=None, skip_coords=False, num_points=20, use_matcher_points=False, matcher_calculator=None, text_prompt="visual", use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, use_query_self_matching=False, use_attn_prior=False, attn_prior_mode="topk_sampling", attn_prior_layers="last"):
+def get_self_attn_bottomk_points(query_img, text_prompt, num_points, matcher_calculator,
+                                  attn_layers, visual_prompt=None, visual_prompt_mask=None,
+                                  include_text_in_prompt=True):
+    """
+    Exp 7: select num_points prompt points from the fusion encoder self-attention map,
+    choosing the bottom-k patches (lowest row-sum = empirically the object region).
+    Returns norm_pts [num_points, 2] in normalized (x, y) coords.
+    """
+    matcher_calculator.get_fused_image_features(
+        query_img,
+        text_prompt=text_prompt,
+        visual_prompt=visual_prompt,
+        visual_prompt_mask=visual_prompt_mask,
+        attn_layers=attn_layers,
+        include_text_in_prompt=include_text_in_prompt,
+    )
+    self_map = matcher_calculator.last_self_attn_map  # [72, 72] numpy float32
+    W = matcher_calculator.encoder_feat_size           # 72
+    patch_size = matcher_calculator.encoder_patch_size # 14
+    resolution = float(matcher_calculator.resolution)  # 1008.0
+
+    attn_flat = torch.from_numpy(self_map).flatten()
+    bottomk_idx = torch.topk(attn_flat, k=num_points, largest=False).indices
+    px = (bottomk_idx % W) * patch_size + patch_size // 2
+    py = (bottomk_idx // W) * patch_size + patch_size // 2
+    norm_pts = torch.stack([px.float() / resolution, py.float() / resolution], dim=1)
+    print(f"[SelfAttnBottomk] sampled {num_points} pts from self-attn map "
+          f"(layers={attn_layers}, include_text={include_text_in_prompt})")
+    return norm_pts.cpu().numpy()  # [num_points, 2]
+
+
+def get_dense_cross_attn_points(processor=None, support_imgs=None, support_masks=None,
+                                 query_img=None, num_points=20, matcher_calculator=None,
+                                 text_prompt="visual", skip_coords=False,
+                                 dense_cross_attn_mode="topk_sampling",
+                                 attn_layers="all",
+                                 skip_text_injection=False,
+                                 sampling="random", visualize=False, visual_output_path=None):
+    """
+    Exp 6: Extract prompt points using dense cross-attention between query patches and
+    foreground support patches (pre-softmax logits aggregated into a localization heatmap).
+
+    Returns:
+        topk_sampling mode: norm_pts [N, 2] (heatmap stored on matcher_calculator)
+        rerank_matcher mode: (pts_norm_sampled [N, 1, 2], all_pts_norm [M, 2], norm_box)
+    """
+    if processor is None:
+        raise Exception("Processor is not specified")
+    if support_imgs is None or support_masks is None:
+        raise Exception("Support images and masks are required for dense cross-attention")
+    if query_img is None:
+        raise Exception("Query image is required for dense cross-attention")
+    if matcher_calculator is None:
+        raise Exception("Matcher calculator is required for dense cross-attention")
+
+    # Build support visual prompt to condition the cross-attention layers (Exp 6 still
+    # uses cross-attn to text+visual; only self-attn is replaced with dense support attn)
+    agg_support_prompt, agg_support_mask = encode_support_visual_tokens(
+        processor, support_imgs, support_masks, num_points, skip_coords, tag="DenseCA"
+    )
+
+    # Run the dense cross-attention pass and extract the heatmap
+    heatmap_2d = matcher_calculator.get_dense_cross_attn_map(
+        query_img=query_img,
+        support_imgs=support_imgs,
+        support_masks=support_masks,
+        text_prompt=text_prompt,
+        skip_coords=skip_coords,
+        attn_layers=attn_layers,
+        visual_prompt=agg_support_prompt,
+        visual_prompt_mask=agg_support_mask,
+        skip_text_injection=skip_text_injection,
+    )
+
+    H = W = matcher_calculator.encoder_feat_size  # 72
+    patch_size = matcher_calculator.encoder_patch_size  # 14
+    resolution = float(matcher_calculator.resolution)  # 1008
+
+    heatmap_tensor = torch.from_numpy(heatmap_2d).flatten()  # [5184]
+
+    if dense_cross_attn_mode == "topk_sampling":
+        topk_idx = torch.topk(heatmap_tensor, k=num_points).indices  # [num_points]
+        px = (topk_idx % W) * patch_size + patch_size // 2
+        py = (topk_idx // W) * patch_size + patch_size // 2
+        norm_pts = torch.stack([px.float() / resolution, py.float() / resolution], dim=1)
+        print(f"[DenseCA] sampled {num_points} points from pre-softmax heatmap (mode=topk, layers={attn_layers})")
+        return norm_pts.numpy()
+
+    elif dense_cross_attn_mode == "rerank_matcher":
+        # First get matcher candidates, then rerank by heatmap score
+        pts_norm, all_pts_norm, norm_box = get_points_from_matcher(
+            support_imgs=support_imgs, support_masks=support_masks, query_img=query_img,
+            num_points=num_points * 3,  # oversample then rerank
+            matcher_calculator=matcher_calculator,
+            text_prompt=text_prompt, use_fused_matcher_features=True,
+            skip_coords=skip_coords, sampling=sampling,
+            visualize=visualize, visual_output_path=visual_output_path,
+        )
+        if pts_norm is None:
+            print("[DenseCA] rerank_matcher: no matcher points — falling back to topk_sampling")
+            topk_idx = torch.topk(heatmap_tensor, k=num_points).indices
+            px = (topk_idx % W) * patch_size + patch_size // 2
+            py = (topk_idx // W) * patch_size + patch_size // 2
+            norm_pts_fallback = torch.stack(
+                [px.float() / resolution, py.float() / resolution], dim=1
+            ).numpy()
+            return norm_pts_fallback, all_pts_norm, norm_box
+
+        # Score each candidate by heatmap value at its patch location
+        all_pts_px = (all_pts_norm * resolution).astype(int)
+        patch_col = np.clip(all_pts_px[:, 0] // patch_size, 0, W - 1)
+        patch_row = np.clip(all_pts_px[:, 1] // patch_size, 0, H - 1)
+        scores = heatmap_2d[patch_row, patch_col]
+        top_indices = np.argsort(scores)[::-1][:num_points]
+        pts_norm_reranked = all_pts_norm[top_indices][:, None, :]
+        print(f"[DenseCA] reranked {len(all_pts_norm)} matcher candidates → {num_points} by heatmap score")
+        return pts_norm_reranked, all_pts_norm, norm_box
+
+    else:
+        raise ValueError(f"Unknown dense_cross_attn_mode: {dense_cross_attn_mode}")
+
+
+def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_masks=None, query_img=None, skip_coords=False, num_points=20, matcher_calculator=None, text_prompt="visual", use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, experiment_mode="random", attn_prior_mode="topk_sampling", attn_layers="last", dense_cross_attn_mode="topk_sampling", dense_cross_attn_skip_text_injection=False, sampling_inputs="both"):
     if processor is None:
         raise Exception("Processor is not specified")
     if support_imgs is None:
         raise Exception("Support images are not specified")
     if support_masks is None:
         raise Exception("Support masks are not specified")
-    if query_img is None and (use_matcher_points or use_query_self_matching or use_attn_prior):
-        raise Exception("Query image is not specified when use_matcher_points, use_query_self_matching or use_attn_prior is True")
-    if matcher_calculator is None and (use_matcher_points or use_query_self_matching or use_attn_prior):
-        raise Exception("Matcher calculator is required when use_matcher_points, use_query_self_matching or use_attn_prior is True")
+    _needs_query = experiment_mode in ("matcher", "self_matching", "attn_prior", "dense_cross_attn", "self_attn_bottomk")
+    if query_img is None and _needs_query:
+        raise Exception(f"Query image is required for experiment_mode={experiment_mode}")
+    if matcher_calculator is None and _needs_query:
+        raise Exception(f"matcher_calculator is required for experiment_mode={experiment_mode}")
 
-    if use_query_self_matching:
+    if experiment_mode == "dense_cross_attn":
+        _mode = f"dense_cross_attn_{dense_cross_attn_mode}"
+    elif experiment_mode == "self_matching":
         _mode = "query_self_matching"
-    elif use_attn_prior:
+    elif experiment_mode == "attn_prior":
         _mode = f"attn_prior_{attn_prior_mode}"
-    elif use_matcher_points:
+    elif experiment_mode == "matcher":
         _mode = "matcher_points"
+    elif experiment_mode == "self_attn_bottomk":
+        _mode = f"self_attn_bottomk ({sampling_inputs})"
     else:
         _mode = "random_support"
     print(f"[PromptTokens] mode='{_mode}' | nshot={support_imgs.shape[0]} | text='{text_prompt}'")
@@ -655,15 +787,71 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
 
     assert support_imgs.shape[0] == support_masks.shape[0]
 
+    # Resolve sampling-pass inputs for experiments that query the fusion encoder
+    _sampling_vp, _sampling_vm, _include_text = None, None, True
+    if experiment_mode in ("attn_prior", "self_attn_bottomk"):
+        if sampling_inputs in ("both", "support_only"):
+            _sampling_vp, _sampling_vm = encode_support_visual_tokens(
+                processor, support_imgs, support_masks, num_points, skip_coords, tag="Sampling"
+            )
+        _include_text = (sampling_inputs != "support_only")
+
     # All point/box data returned is in normalized [0,1] coordinates
     norm_pts_sampled = None
     all_norm_pts = None
     norm_box = None
     actual_pts_sampled = None
-    attn_map_2d = None
-
-    if use_query_self_matching:
-        # Query self-matching mode: get points from matching query features
+    if experiment_mode == "dense_cross_attn":
+        # Exp 6: dense cross-attention heatmap → sample prompt points
+        result = get_dense_cross_attn_points(
+            processor=processor,
+            support_imgs=support_imgs,
+            support_masks=support_masks,
+            query_img=query_img,
+            num_points=num_points,
+            matcher_calculator=matcher_calculator,
+            text_prompt=text_prompt,
+            skip_coords=skip_coords,
+            dense_cross_attn_mode=dense_cross_attn_mode,
+            attn_layers=attn_layers,
+            skip_text_injection=dense_cross_attn_skip_text_injection,
+            sampling=sampling,
+            visualize=visualize,
+            visual_output_path=visual_output_path,
+        )
+        if dense_cross_attn_mode == "topk_sampling":
+            pts_norm = result
+            if pts_norm is not None:
+                state = encode_pts_prompts(processor, query_img, pts_norm, skip_coords)
+                all_visual_tokens.append(state["prompt"])
+                all_visual_masks.append(state["prompt_mask"])
+                norm_pts_sampled = pts_norm
+                all_norm_pts = pts_norm
+        else:  # rerank_matcher
+            pts_norm, all_pts_norm_r, box_norm = result
+            if pts_norm is not None:
+                pts_norm_squeezed = pts_norm.squeeze(1) if pts_norm.ndim == 3 else pts_norm
+                state = encode_pts_prompts(processor, query_img, pts_norm_squeezed, skip_coords)
+                all_visual_tokens.append(state["prompt"])
+                all_visual_masks.append(state["prompt_mask"])
+                norm_pts_sampled = pts_norm_squeezed
+                all_norm_pts = all_pts_norm_r
+                norm_box = box_norm
+    elif experiment_mode == "self_attn_bottomk":
+        # Exp 7: bottom-k points from fusion encoder self-attention map
+        pts_norm = get_self_attn_bottomk_points(
+            query_img, text_prompt, num_points, matcher_calculator, attn_layers,
+            visual_prompt=_sampling_vp, visual_prompt_mask=_sampling_vm,
+            include_text_in_prompt=_include_text,
+        )
+        if pts_norm is not None:
+            state = encode_pts_prompts(processor, query_img, pts_norm, skip_coords)
+            all_visual_tokens.append(state["prompt"])
+            all_visual_masks.append(state["prompt_mask"])
+            norm_pts_sampled = pts_norm
+            all_norm_pts = pts_norm
+    elif experiment_mode == "self_matching":
+        # Exp 4: query self-matching mode
         pts_norm, all_pts_norm, box_norm = get_query_self_matching_points(
             processor=processor,
             support_imgs=support_imgs,
@@ -684,15 +872,12 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
             norm_pts_sampled = pts_norm
             all_norm_pts = all_pts_norm
             norm_box = box_norm
-    elif use_attn_prior:
-        # Aggregate support visual tokens to condition the fusion encoder
-        agg_support_prompt, agg_support_mask = encode_support_visual_tokens(
-            processor, support_imgs, support_masks, num_points, skip_coords, tag="AttnPrior"
-        )
+    elif experiment_mode == "attn_prior":
+        # Exp 5: top-k points from fusion encoder cross-attention map
         if attn_prior_mode == "topk_sampling":
-            pts_norm, attn_map_2d = get_attn_prior_points(
-                query_img, text_prompt, num_points, matcher_calculator, attn_prior_layers,
-                visual_prompt=agg_support_prompt, visual_prompt_mask=agg_support_mask,
+            pts_norm = get_attn_prior_points(
+                query_img, text_prompt, num_points, matcher_calculator, attn_layers,
+                visual_prompt=_sampling_vp, visual_prompt_mask=_sampling_vm,
             )
             if pts_norm is not None:
                 state = encode_pts_prompts(processor, query_img, pts_norm, skip_coords)
@@ -708,9 +893,9 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
                 skip_coords=skip_coords, sampling=sampling, visualize=visualize,
                 visual_output_path=visual_output_path,
                 use_attn_prior_rerank=True,
-                reference_visual_prompt=agg_support_prompt,
-                reference_visual_mask=agg_support_mask,
-                attn_prior_layers=attn_prior_layers,
+                reference_visual_prompt=_sampling_vp,
+                reference_visual_mask=_sampling_vm,
+                attn_layers=attn_layers,
             )
             if pts_norm is not None:
                 state = encode_pts_prompts(processor, query_img, pts_norm, skip_coords)
@@ -719,10 +904,15 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
                 norm_pts_sampled = pts_norm
                 all_norm_pts = all_pts_norm
                 norm_box = box_norm
-
-    elif use_matcher_points:
-        # Standard matcher mode: get points from support-to-query matching
-        pts_norm, all_pts_norm, box_norm = get_points_from_matcher(support_imgs=support_imgs, support_masks=support_masks, query_img=query_img, num_points=num_points, matcher_calculator=matcher_calculator, text_prompt=text_prompt, use_fused_matcher_features=use_fused_matcher_features, skip_coords=skip_coords, sampling=sampling, visualize=visualize, visual_output_path=visual_output_path)
+    elif experiment_mode == "matcher":
+        # Standard matcher mode: bipartite point matching support→query
+        pts_norm, all_pts_norm, box_norm = get_points_from_matcher(
+            support_imgs=support_imgs, support_masks=support_masks, query_img=query_img,
+            num_points=num_points, matcher_calculator=matcher_calculator,
+            text_prompt=text_prompt, use_fused_matcher_features=use_fused_matcher_features,
+            skip_coords=skip_coords, sampling=sampling, visualize=visualize,
+            visual_output_path=visual_output_path,
+        )
         if pts_norm is not None:
             state = encode_pts_prompts(processor, query_img, pts_norm, skip_coords)
             all_visual_tokens.append(state["prompt"])
@@ -730,7 +920,7 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
             norm_pts_sampled = pts_norm
             all_norm_pts = all_pts_norm
             norm_box = box_norm
-    else:
+    else:  # "random"
         for idx in range(support_imgs.shape[0]):
             support_img = support_imgs[idx]
             support_mask = support_masks[idx]
@@ -753,7 +943,7 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
     aggregated_visual_prompt = torch.cat(all_visual_tokens, dim=0)
     aggregated_visual_mask = torch.cat(all_visual_masks, dim=1)
     
-    return aggregated_visual_prompt, aggregated_visual_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled, attn_map_2d
+    return aggregated_visual_prompt, aggregated_visual_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled
 
 def aggregate_prompt_with_text_tokens(processor=None, state=None, text_prompt="visual", aggregated_visual_prompt=None, aggregated_visual_mask=None):
     if processor is None:
@@ -793,7 +983,7 @@ def update_state_with_support_prompt(state=None, prompt=None, prompt_mask=None, 
     
     return state
 
-def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, support_masks=None, text_prompt="visual", skip_coords=False, num_points=20, use_matcher_points=False, matcher_calculator=None, use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, use_query_self_matching=False, use_attn_prior=False, attn_prior_mode="topk_sampling", attn_prior_layers="last"):
+def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, support_masks=None, text_prompt="visual", skip_coords=False, num_points=20, matcher_calculator=None, use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, experiment_mode="random", attn_prior_mode="topk_sampling", attn_layers="last", dense_cross_attn_mode="topk_sampling", dense_cross_attn_skip_text_injection=False, sampling_inputs="both"):
     if sam3 is None:
         raise Exception("SAM3 is not specified")
     elif query_frame is None:
@@ -802,45 +992,51 @@ def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, suppo
         raise Exception("Support images are not specified")
     elif support_masks is None:
         raise Exception("Support masks are not specified")
-    elif matcher_calculator is None and (use_matcher_points or use_attn_prior):
-        raise Exception("Matcher calculator is required when use_matcher_points or use_attn_prior is True")
+    elif matcher_calculator is None and experiment_mode in (
+        "matcher", "self_matching", "attn_prior", "dense_cross_attn", "self_attn_bottomk"
+    ):
+        raise Exception(f"matcher_calculator is required for experiment_mode={experiment_mode}")
 
-    visual_prompt, visual_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled, attn_map_2d = get_prompt_tokens_from_support(
+    visual_prompt, visual_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled = get_prompt_tokens_from_support(
         processor=sam3.processor,
         support_imgs=support_imgs,
         support_masks=support_masks,
         query_img=query_frame,
         skip_coords=skip_coords,
         num_points=num_points,
-        use_matcher_points=use_matcher_points,
         matcher_calculator=matcher_calculator,
         text_prompt=text_prompt,
         use_fused_matcher_features=use_fused_matcher_features,
         sampling=sampling,
         visualize=visualize,
         visual_output_path=visual_output_path,
-        use_query_self_matching=use_query_self_matching,
-        use_attn_prior=use_attn_prior,
+        experiment_mode=experiment_mode,
         attn_prior_mode=attn_prior_mode,
-        attn_prior_layers=attn_prior_layers,
+        attn_layers=attn_layers,
+        dense_cross_attn_mode=dense_cross_attn_mode,
+        dense_cross_attn_skip_text_injection=dense_cross_attn_skip_text_injection,
+        sampling_inputs=sampling_inputs,
     )
     final_prompt, final_mask, text_outputs = aggregate_prompt_with_text_tokens(
-        processor=sam3.processor, 
-        text_prompt=text_prompt, 
-        aggregated_visual_prompt=visual_prompt, 
+        processor=sam3.processor,
+        text_prompt=text_prompt,
+        aggregated_visual_prompt=visual_prompt,
         aggregated_visual_mask=visual_mask
     )
+    # Store num_text_tokens so the inference-path capture can split cross-attn by token type
+    if matcher_calculator is not None and "language_features" in text_outputs:
+        matcher_calculator.last_num_text_tokens = text_outputs["language_features"].shape[0]
     state = sam3.processor.set_image(query_frame)
     state = update_state_with_support_prompt(
-        state=state, 
-        prompt=final_prompt, 
-        prompt_mask=final_mask, 
+        state=state,
+        prompt=final_prompt,
+        prompt_mask=final_mask,
         text_outputs=text_outputs
     )
     state = sam3.processor._forward_with_encoded_prompt(state)
     print(f"Found {len(state['scores'])} objects")
     merged_mask = np.any(np.array(state['masks'].cpu()), axis=0).squeeze(0)
-    return merged_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled, attn_map_2d
+    return merged_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled
 
 
 def main():
@@ -904,12 +1100,15 @@ def main():
     print("STARTING SEGMENTATION")
     print("-" * 50)
     with torch.no_grad():
-        for idx, data in enumerate(loader):
-            # Deterministic seed for every episode
+        for idx in range(len(loader)):
+            # Deterministic seed set BEFORE data loading so support image sampling
+            # (np.random.choice inside load_frame) is identical across all experiments.
             current_seed = args.seed + (args.run_n * 10000) + idx
             random.seed(current_seed)
             np.random.seed(current_seed)
             torch.manual_seed(current_seed)
+
+            data = loader[idx]
             
             query_imgs = data['query_imgs']
             query_masks = data['query_masks']
@@ -947,18 +1146,16 @@ def main():
                 vid_output_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "output")
                 vid_ground_truth_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "ground_truth")
                 vid_frames_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "frames")
-                if args.matcher_points:
+                vid_attn_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "attention_maps")
+                if args.experiment_mode == "matcher":
                     vid_box_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "bounding_box")
-                if args.use_attn_prior:
-                    vid_attn_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "attention_maps")
 
                 os.makedirs(vid_output_dir, exist_ok=True)
                 os.makedirs(vid_ground_truth_dir, exist_ok=True)
                 os.makedirs(vid_frames_dir, exist_ok=True)
-                if args.matcher_points:
+                os.makedirs(vid_attn_dir, exist_ok=True)
+                if args.experiment_mode == "matcher":
                     os.makedirs(vid_box_dir, exist_ok=True)
-                if args.use_attn_prior:
-                    os.makedirs(vid_attn_dir, exist_ok=True)
 
                 predictions = []
                 ground_truths = []
@@ -983,37 +1180,44 @@ def main():
                     print(f"query_frame shape: {query_frame.shape}")
                     print(f"ground_truth shape: {ground_truth.shape}")
                     
-                    if not args.use_query_as_support:
-                        prediction, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled, attn_map_2d = cross_image_prediction(
-                            sam3=sam3,
-                            query_frame=query_frame,
-                            support_imgs=support_imgs,
-                            support_masks=support_masks,
-                            # 'visual' is a dummy token to bypass the text encoder
-                            text_prompt=lemma if not args.disable_text else "visual",
-                            skip_coords=args.skip_coords,
-                            num_points=args.num_points_from_mask,
-                            use_matcher_points=args.matcher_points,
-                            matcher_calculator=matcher_calculator,
-                            use_fused_matcher_features=args.use_fused_matcher_features,
-                            sampling=args.sampling,
-                            visualize=args.visualize_embeddings,
-                            visual_output_path=os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}_tsne.png") if args.visualize_embeddings and args.matcher_points else None,
-                            use_query_self_matching=args.use_query_self_matching,
-                            use_attn_prior=args.use_attn_prior,
-                            attn_prior_mode=args.attn_prior_mode,
-                            attn_prior_layers=args.attn_prior_layers,
-                        )
+                    _text = lemma if not args.disable_text else "visual"
+                    if args.use_query_as_support:
+                        _sup_imgs  = query_frame.unsqueeze(0)
+                        _sup_masks = ground_truth.unsqueeze(0)
                     else:
-                        prediction, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled, attn_map_2d = cross_image_prediction(
-                            sam3=sam3,
-                            query_frame=query_frame,
-                            support_imgs=query_frame.unsqueeze(0),
-                            support_masks=ground_truth.unsqueeze(0),
-                            # 'visual' is a dummy token to bypass the text encoder
-                            text_prompt=lemma if not args.disable_text else "visual",
-                            skip_coords=args.skip_coords,
-                            num_points=args.num_points_from_mask
+                        _sup_imgs  = support_imgs
+                        _sup_masks = support_masks
+
+                    has_dedicated_pass = args.experiment_mode in (
+                        "attn_prior", "dense_cross_attn", "self_attn_bottomk"
+                    )
+                    if not has_dedicated_pass:
+                        matcher_calculator.arm_inference_capture(args.attn_layers)
+
+                    prediction, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled = cross_image_prediction(
+                        sam3=sam3,
+                        query_frame=query_frame,
+                        support_imgs=_sup_imgs,
+                        support_masks=_sup_masks,
+                        text_prompt=_text,
+                        skip_coords=args.skip_coords,
+                        num_points=args.num_points_from_mask,
+                        matcher_calculator=matcher_calculator,
+                        use_fused_matcher_features=args.use_fused_matcher_features,
+                        sampling=args.sampling,
+                        visualize=args.visualize_embeddings,
+                        visual_output_path=os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}_tsne.png") if args.visualize_embeddings and args.experiment_mode == "matcher" else None,
+                        experiment_mode=args.experiment_mode,
+                        attn_prior_mode=args.attn_prior_mode,
+                        attn_layers=args.attn_layers,
+                        dense_cross_attn_mode=args.dense_cross_attn_mode,
+                        dense_cross_attn_skip_text_injection=args.dense_cross_attn_skip_text_injection,
+                        sampling_inputs=args.sampling_inputs,
+                    )
+
+                    if not has_dedicated_pass:
+                        matcher_calculator.collect_inference_attn(
+                            args.attn_layers, matcher_calculator.last_num_text_tokens
                         )
 
                     img_pil = Image.fromarray(img_numpy)
@@ -1028,7 +1232,9 @@ def main():
                     pixel_size = (actual_w, actual_h)
 
                     # Single rescale from [0,1] → pixels, only when we have query-side points
-                    has_query_pts = args.matcher_points or args.use_query_as_support or args.use_query_self_matching or args.use_attn_prior
+                    has_query_pts = args.experiment_mode in (
+                        "matcher", "self_matching", "attn_prior", "dense_cross_attn", "self_attn_bottomk"
+                    ) or args.use_query_as_support
                     
                     # Use actual points if available (from mask), otherwise rescale normalized points (from matcher)
                     if actual_pts_sampled is not None:
@@ -1039,17 +1245,33 @@ def main():
                     rescaled_all_pts = rescale_to_pixel(all_norm_pts, pixel_size) if all_norm_pts is not None else None
                     rescaled_box = rescale_to_pixel(norm_box, pixel_size) if norm_box is not None else None
 
-                    if args.matcher_points:
+                    if args.experiment_mode == "matcher":
                         if rescaled_all_pts is not None and rescaled_sampled_pts is not None:
                             save_image_with_all_and_sampled_points(img_numpy, rescaled_all_pts, rescaled_sampled_pts, os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}_matcher_points.png"))
-                        
+
                         if rescaled_box is not None:
                             save_image_with_box(img_numpy, rescaled_box, os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}_matcher_box.png"))
 
-                    if args.use_attn_prior and attn_map_2d is not None:
-                        save_attn_heatmap(img_numpy, attn_map_2d, os.path.join(vid_attn_dir, f"frame_{chosen_frames[frame_idx]}_attn_prior.png"))
-                        if rescaled_sampled_pts is not None:
-                            save_image_with_all_and_sampled_points(img_numpy, rescaled_all_pts, rescaled_sampled_pts, os.path.join(vid_attn_dir, f"frame_{chosen_frames[frame_idx]}_attn_points.png"))
+                    # Save all attention maps for this frame
+                    frame_tag = chosen_frames[frame_idx]
+                    _sfx = args.attn_layers
+                    for _map_name, _attn_map in [
+                        ("cross_total",  matcher_calculator.last_cross_attn_map),
+                        ("cross_text",   matcher_calculator.last_cross_attn_text_map),
+                        ("cross_points", matcher_calculator.last_cross_attn_points_map),
+                        ("self",         matcher_calculator.last_self_attn_map),
+                    ]:
+                        if _attn_map is not None:
+                            save_attn_heatmap(
+                                img_numpy, _attn_map,
+                                os.path.join(vid_attn_dir, f"frame_{frame_tag}_{_map_name}_{_sfx}.png")
+                            )
+                    # Points overlay on the visual/points-prior map
+                    if rescaled_sampled_pts is not None and matcher_calculator.last_cross_attn_points_map is not None:
+                        save_image_with_all_and_sampled_points(
+                            img_numpy, rescaled_all_pts, rescaled_sampled_pts,
+                            os.path.join(vid_attn_dir, f"frame_{frame_tag}_cross_points_{_sfx}_sampled.png")
+                        )
 
                     # Point score evaluation
                     if rescaled_sampled_pts is not None:
@@ -1057,7 +1279,7 @@ def main():
                     else:
                         point_scores_list.append(None)
                     
-                    if (args.matcher_points or args.use_attn_prior) and rescaled_all_pts is not None:
+                    if args.experiment_mode in ("matcher", "attn_prior") and rescaled_all_pts is not None:
                         all_point_scores_list.append(rescaled_all_pts)
                     else:
                         all_point_scores_list.append(None)

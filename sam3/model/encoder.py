@@ -82,6 +82,10 @@ class TransformerEncoderLayer(nn.Module):
         self.layer_idx = None
         self.capture_cross_attn_weights = False
         self.last_cross_attn_weights = None
+        # Exp 6: dense cross-attention — set externally before forward()
+        self.dense_support_feats = None        # [K, 1, 256] seq-first foreground patches
+        self.capture_self_attn_weights = False
+        self.last_self_attn_weights = None
 
     def forward_post(
         self,
@@ -114,12 +118,27 @@ class TransformerEncoderLayer(nn.Module):
         Returns:
             Processed tensor
         """
-        q = k = tgt + query_pos if self.pos_enc_at_attn else tgt
+        q = tgt + query_pos if self.pos_enc_at_attn else tgt
 
-        # Self attention
-        tgt2 = self.self_attn(
-            q, k, value=tgt, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask
-        )[0]
+        # Self attention (or dense cross-attention to support patches when Exp 6 is active)
+        k_self = self.dense_support_feats if self.dense_support_feats is not None else q
+        v_self = self.dense_support_feats if self.dense_support_feats is not None else tgt
+        sa_mask = None if self.dense_support_feats is not None else tgt_mask
+        sa_kpm = None if self.dense_support_feats is not None else tgt_key_padding_mask
+        if self.capture_self_attn_weights:
+            attn_out, pre_logits = self.self_attn(
+                q, k_self, v_self,
+                attn_mask=sa_mask, key_padding_mask=sa_kpm,
+                return_pre_softmax=True,
+                average_attn_weights=True,
+            )
+            self.last_self_attn_weights = pre_logits.detach()
+            tgt2 = attn_out
+        else:
+            tgt2 = self.self_attn(
+                q, k_self, v_self,
+                attn_mask=sa_mask, key_padding_mask=sa_kpm,
+            )[0]
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
@@ -131,7 +150,7 @@ class TransformerEncoderLayer(nn.Module):
                 value=memory,
                 attn_mask=memory_mask,
                 key_padding_mask=memory_key_padding_mask,
-                need_weights=True,
+                return_pre_softmax=True,
                 average_attn_weights=True,
             )
             self.last_cross_attn_weights = attn_w.detach()
@@ -194,10 +213,26 @@ class TransformerEncoderLayer(nn.Module):
             other_tgt = tgt[tgt.shape[0] // 2 :]
             tgt = tgt[: tgt.shape[0] // 2]
         tgt2 = self.norm1(tgt)
-        q = k = tgt2 + query_pos if self.pos_enc_at_attn else tgt2
-        tgt2 = self.self_attn(
-            q, k, value=tgt2, attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask
-        )[0]
+        q = tgt2 + query_pos if self.pos_enc_at_attn else tgt2
+        # Self attention (or dense cross-attention to support patches when Exp 6 is active)
+        k_self = self.dense_support_feats if self.dense_support_feats is not None else q
+        v_self = self.dense_support_feats if self.dense_support_feats is not None else tgt2
+        sa_mask = None if self.dense_support_feats is not None else tgt_mask
+        sa_kpm = None if self.dense_support_feats is not None else tgt_key_padding_mask
+        if self.capture_self_attn_weights:
+            attn_out, pre_logits = self.self_attn(
+                q, k_self, v_self,
+                attn_mask=sa_mask, key_padding_mask=sa_kpm,
+                return_pre_softmax=True,
+                average_attn_weights=True,
+            )
+            self.last_self_attn_weights = pre_logits.detach()
+            tgt2 = attn_out
+        else:
+            tgt2 = self.self_attn(
+                q, k_self, v_self,
+                attn_mask=sa_mask, key_padding_mask=sa_kpm,
+            )[0]
         tgt = tgt + self.dropout1(tgt2)
         if dac:
             # Recombine
@@ -210,7 +245,7 @@ class TransformerEncoderLayer(nn.Module):
                 value=memory,
                 attn_mask=memory_mask,
                 key_padding_mask=memory_key_padding_mask,
-                need_weights=True,
+                return_pre_softmax=True,
                 average_attn_weights=True,
             )
             self.last_cross_attn_weights = attn_w.detach()
@@ -530,6 +565,9 @@ class TransformerEncoderFusion(TransformerEncoder):
         if self.add_pooled_text_to_img_feat:
             self.text_pooling_proj = nn.Linear(d_model, d_model)
         self.pool_text_with_mask = pool_text_with_mask
+        # Runtime flag: set externally to True to skip the text pooling injection
+        # (e.g. during dense cross-attention experiments to avoid text bias on query patches)
+        self.skip_text_pooling_injection = False
         if compile_mode is not None:
             self.forward = torch.compile(
                 self.forward, mode=compile_mode, fullgraph=True
@@ -570,7 +608,7 @@ class TransformerEncoderFusion(TransformerEncoder):
                 "expected list of (bs, c, h, w) tensors"
             )
 
-        if self.add_pooled_text_to_img_feat:
+        if self.add_pooled_text_to_img_feat and not self.skip_text_pooling_injection:
             # Fusion: Add mean pooled text to image features
             pooled_text = pool_text_feat(
                 prompt, prompt_key_padding_mask, self.pool_text_with_mask
