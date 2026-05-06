@@ -73,7 +73,7 @@ The key design levers are:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--experiment_mode` | str | `random` | Selects which experiment / point-selection strategy to run. See experiment descriptions below. Choices: `random`, `matcher`, `self_matching`, `attn_prior`, `dense_cross_attn`, `self_attn_bottomk` |
+| `--experiment_mode` | str | `random` | Selects which experiment / point-selection strategy to run. See experiment descriptions below. Choices: `random`, `matcher`, `self_matching`, `attn_prior`, `dense_cross_attn`, `self_attn` |
 
 **`--experiment_mode` choices:**
 
@@ -84,14 +84,14 @@ The key design levers are:
 | `self_matching` | Exp 4 | Query self-matching: match query features with/without support embeddings |
 | `attn_prior` | Exp 5 | Top-k from Fusion Encoder cross-attention map |
 | `dense_cross_attn` | Exp 6 | Dense cross-attention to support foreground patches |
-| `self_attn_bottomk` | Exp 7 | Bottom-k from Fusion Encoder self-attention map |
+| `self_attn` | Exp 7 | Bottom-k (or top-k) from Fusion Encoder self-attention map |
 
 ### Matcher Controls
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--use_fused_matcher_features` | bool | False | Use fusion encoder output features for matching instead of raw backbone features. Only relevant for `--experiment_mode matcher`; for all other fusion-encoder experiments the fusion encoder is always used |
-| `--sampling` | str | `random` | Subsampling strategy applied to the matcher's candidate points. Only active for `experiment_mode=matcher` or `attn_prior --attn_prior_mode rerank_matcher` |
+| `--sampling` | str | `random` | Subsampling strategy applied to the matcher's candidate points. Only active for `experiment_mode=matcher` |
 
 **`--sampling` choices:**
 
@@ -105,30 +105,25 @@ The key design levers are:
 | `k-medoids-embeddings` | K-Medoids on patch embeddings (returns actual data points) |
 | `k-medoids-points` | K-Medoids on 2D point coordinates |
 
-### Attention Map Aggregation (Experiments 5, 6, 7)
+### Attention Map Aggregation & Sampling (Experiments 5, 6, 7)
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--attn_layers` | str | `last` | Which Fusion Encoder layers to aggregate attention from, for both point selection (Exp 5/6/7) and map saving (all experiments). `last` = final layer only (most semantic); `all` = mean over all 6 layers |
-
-### Attention Prior Sub-options (Experiment 5)
-
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--attn_prior_mode` | str | `topk_sampling` | How to use the cross-attention map. Choices: `topk_sampling` (sample top-k patches directly — no matcher), `rerank_matcher` (run matcher, then reorder candidates by attention weight) |
+| `--attention_aggregate_function` | str | `sum` | Aggregation function used to aggregate attention matrices on the key dimension. Choices: `sum`, `mean`, `max`, `min`, `top-*-mean` (e.g. `top-5-mean`) |
+| `--attn_sampling_mode` | str | `top-k` | Point sampling method for attention priors. Choices: `top-k`, `bottom-k` |
 
 ### Dense Cross-Attention Sub-options (Experiment 6)
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--dense_cross_attn_mode` | str | `topk_sampling` | How to derive final prompt points from the heatmap. Choices: `topk_sampling` (direct top-k from heatmap — no matcher), `rerank_matcher` (run matcher, then rerank by heatmap score) |
 | `--dense_cross_attn_skip_text_injection` | bool | False | Skip the pooled-text→image-patch injection before the Fusion Encoder, so query features are purely visual during the dense cross-attention pass |
 
 ### Sampling Pass Input Control (Experiments 5 and 7)
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--sampling_inputs` | str | `both` | Controls what goes into the Fusion Encoder during the **point-selection forward pass** (the dedicated pass that extracts the attention map used for point selection). Only relevant for `--experiment_mode attn_prior` and `self_attn_bottomk`. The final SAM3 inference pass is always run with text + support visual tokens |
+| `--sampling_inputs` | str | `both` | Controls what goes into the Fusion Encoder during the **point-selection forward pass** (the dedicated pass that extracts the attention map used for point selection). Only relevant for `--experiment_mode attn_prior` and `self_attn`. The final SAM3 inference pass is always run with text + support visual tokens |
 
 **`--sampling_inputs` choices:**
 
@@ -155,7 +150,7 @@ A fifth file `frame_{tag}_cross_points_{attn_layers}_sampled.png` shows the samp
 
 **What each map means per experiment:**
 
-| Map | Exp 1 / 2 / 3 / 4 | Exp 5 — attention prior | Exp 6 — dense cross-attn | Exp 7 — self-attn bottom-k |
+| Map | Exp 1 / 2 / 3 / 4 | Exp 5 — attention prior | Exp 6 — dense cross-attn | Exp 7 — self-attn |
 |-----|--------------------|-------------------------|--------------------------|---------------------------|
 | `cross_total` | Query patches → all prompt tokens (inference pass) | Query patches → all prompt tokens (decision pass) | Query patches → all prompt tokens (decision pass) | Query patches → all prompt tokens (decision pass) |
 | `cross_text` | Query patches → text tokens only (inference pass) | Query patches → text tokens only (decision pass) | Query patches → text tokens only (decision pass) | Query patches → text tokens only (decision pass) |
@@ -189,8 +184,8 @@ Enforced by `validate_args()` at startup — invalid combinations raise an excep
 | `--experiment_mode self_matching` requires `--nshot > 0` |
 | `--experiment_mode self_matching` is incompatible with `--use_query_as_support` |
 | `--experiment_mode dense_cross_attn` requires `--nshot > 0` |
-| `--experiment_mode self_attn_bottomk --sampling_inputs support_only` requires `--nshot > 0` |
-| `--sampling_inputs text_only\|support_only` only applies to `--experiment_mode attn_prior` or `self_attn_bottomk` |
+| `--experiment_mode self_attn --sampling_inputs support_only` requires `--nshot > 0` |
+| `--sampling_inputs text_only\|support_only` only applies to `--experiment_mode attn_prior` or `self_attn` |
 
 ---
 
@@ -332,10 +327,10 @@ Apply --sampling → final points on query → Fusion Encoder → mask
 ```
 --experiment_mode attn_prior
 --nshot N
---attn_prior_mode topk_sampling | rerank_matcher
 --attn_layers last | all
+--attention_aggregate_function sum | mean | max | min | top-*-mean
+--attn_sampling_mode top-k | bottom-k
 [--sampling_inputs both | text_only | support_only]
-[--sampling ...]            # applied after rerank_matcher, ignored for topk_sampling
 ```
 
 **Motivation:** Instead of bipartite matching, use the cross-attention weights of the Fusion Encoder as a localization prior. The Fusion Encoder runs cross-attention with Q = query image patches and K/V = prompt tokens (text + support visual embeddings). Patches with high attention weight are likely to contain the object referred to by the prompts.
@@ -354,38 +349,20 @@ Point selection uses last_cross_attn_points_map (visual token prior only).
 
 All weights are **pre-softmax** raw scaled dot-products (`Q·Kᵀ / √d`), consistent with Exp 6.
 
-#### Mode: `topk_sampling`
-
+**Flow:**
 ```
 Resolve sampling-pass inputs from --sampling_inputs
     both:         use text label + support visual tokens
     text_only:    use text label only (no visual_prompt)
     support_only: use support visual tokens only (no text in cross-attention)
-Run Fusion Encoder on query — capture cross-attn weights
+Run Fusion Encoder on query — capture cross-attn weights (aggregated via --attention_aggregate_function)
 Construct attention map [5184] from target layers
-topk(attn_map, k=--num_points_from_mask) → patch indices → pixel centers → normalized coords
+Sample patches based on --attn_sampling_mode (top-k or bottom-k, k=--num_points_from_mask) → patch indices → pixel centers → normalized coords
 Encode selected points on query image → visual prompt
 Combine with text tokens → Fusion Encoder on query → mask
 ```
 
-Does NOT use the bipartite matcher. Does NOT go through `--sampling` (the attention ranking is the final selection).
-
-#### Mode: `rerank_matcher`
-
-```
-Resolve sampling-pass inputs from --sampling_inputs (applied to the attention capture pass)
-Run standard bipartite matcher (support→query, fusion encoder features)
-    → candidate points on query (possibly hundreds)
-Run Fusion Encoder on query — capture cross-attn weights
-Construct attention map [5184]
-Look up attention score for each candidate point's patch
-Reorder candidates by descending attention score
-Apply --sampling to reduce to --num_points_from_mask final points
-Encode final points on query image → visual prompt
-Combine with text tokens → Fusion Encoder on query → mask
-```
-
-The matcher provides geometrically consistent candidates; attention reranks them by semantic relevance. `--sampling` (e.g. `k-medoids-points`) can then enforce spatial diversity on the reranked set.
+Does NOT use the bipartite matcher. Does NOT go through `--sampling` (the attention map ranking is the final selection).
 
 ---
 
@@ -395,10 +372,10 @@ The matcher provides geometrically consistent candidates; attention reranks them
 ```
 --experiment_mode dense_cross_attn
 --nshot N
---dense_cross_attn_mode topk_sampling | rerank_matcher
 --attn_layers all | last
+--attention_aggregate_function sum | mean | max | min | top-*-mean
+--attn_sampling_mode top-k | bottom-k
 [--dense_cross_attn_skip_text_injection]
-[--sampling ...]            # applied after rerank_matcher, ignored for topk_sampling
 ```
 
 **Motivation:** In the standard pipeline, the query image only sees the support object through a compressed visual prompt in the Fusion Encoder's cross-attention. Experiment 6 replaces the Fusion Encoder's self-attention with a dense cross-attention where the query image patches directly attend to the support object's foreground patches at patch resolution, enabling explicit patch-level correspondence.
@@ -420,34 +397,19 @@ For each target encoder layer (all or last):
 Mean over target layers → [5184] → reshape [72, 72] heatmap
 ```
 
-#### Mode: `topk_sampling`
+**Flow:**
 
 ```
 Aggregate support visual tokens (random points from GT masks)
 Run modified Fusion Encoder pass with dense_support_feats active
-    → capture pre-softmax self-attn logits from target layers
+    → capture pre-softmax self-attn logits from target layers (aggregated via --attention_aggregate_function)
 Construct heatmap [72, 72]
-topk(heatmap, k=--num_points_from_mask) → patch indices → pixel centers → normalized coords
+Sample patches based on --attn_sampling_mode (top-k or bottom-k, k=--num_points_from_mask) → patch indices → pixel centers → normalized coords
 Encode selected points on query image → visual prompt
 Combine with text tokens → standard Fusion Encoder on query → mask
 ```
 
 Does NOT use the bipartite matcher. The heatmap ranking is the final selection — `--sampling` is ignored.
-
-#### Mode: `rerank_matcher`
-
-```
-Aggregate support visual tokens (random points from GT masks)
-Run modified Fusion Encoder pass → construct heatmap [72, 72]
-Run standard bipartite matcher (support→query, fusion encoder features)
-    → oversample: --num_points_from_mask × 3 candidate points
-Score each candidate by heatmap value at its patch location
-Sort candidates by descending heatmap score → keep top --num_points_from_mask
-Encode final points on query image → visual prompt
-Combine with text tokens → standard Fusion Encoder on query → mask
-```
-
-The matcher provides geometrically consistent candidates; the heatmap reranks them by direct patch-level support relevance.
 
 **Implementation notes:**
 - `dense_support_feats` is set as per-layer state on each `TransformerEncoderLayer` before the encoder forward pass; `capture_self_attn_weights=True` is set on target layers to record pre-softmax logits into `last_self_attn_weights`
@@ -457,13 +419,15 @@ The matcher provides geometrically consistent candidates; the heatmap reranks th
 
 ---
 
-### Experiment 7 — Self-attention bottom-k
+### Experiment 7 — Self-attention
 
 **Flags:**
 ```
---experiment_mode self_attn_bottomk
+--experiment_mode self_attn
 --nshot N
 --attn_layers last | all
+--attention_aggregate_function sum | mean | max | min | top-*-mean
+--attn_sampling_mode top-k | bottom-k
 [--sampling_inputs both | text_only | support_only]
 ```
 
@@ -489,7 +453,7 @@ Resolve sampling-pass inputs from --sampling_inputs:
 
 Run Fusion Encoder on query — capture self-attn weights
 Construct self-attention heatmap [5184] from target layers
-bottomk(heatmap, k=--num_points_from_mask, largest=False) → patch indices → pixel centers → normalized coords
+Sample patches based on --attn_sampling_mode (top-k or bottom-k, k=--num_points_from_mask) → patch indices → pixel centers → normalized coords
 Convert patch index → pixel center: px = (idx % 72) * 14 + 7,  py = (idx // 72) * 14 + 7
 Normalize: [px / 1008, py / 1008]
 
@@ -534,27 +498,29 @@ Both use `return_pre_softmax=True, average_attn_weights=True` internally — raw
     incompatible with: --use_query_as_support
 
 --experiment_mode attn_prior
-    --attn_prior_mode             topk_sampling (default) or rerank_matcher
     --attn_layers                 last (default) or all
     --sampling_inputs             controls fusion encoder inputs in sampling pass
-    --sampling                    active only when --attn_prior_mode rerank_matcher
+    --attention_aggregate_function controls aggregation of attention matrices
+    --attn_sampling_mode          top-k (default) or bottom-k
 
 --experiment_mode dense_cross_attn
     requires: --nshot > 0
-    --dense_cross_attn_mode       topk_sampling (default) or rerank_matcher
     --dense_cross_attn_skip_text_injection  optional
     --attn_layers                 last (default) or all
-    --sampling                    active only when --dense_cross_attn_mode rerank_matcher
+    --attention_aggregate_function controls aggregation of attention matrices
+    --attn_sampling_mode          top-k (default) or bottom-k
 
---experiment_mode self_attn_bottomk
+--experiment_mode self_attn
     --attn_layers                 last (default) or all
     --sampling_inputs             controls fusion encoder inputs in sampling pass
     --sampling_inputs support_only requires --nshot > 0
+    --attention_aggregate_function controls aggregation of attention matrices
+    --attn_sampling_mode          top-k or bottom-k (default)
 
---sampling_inputs                 applies only to --experiment_mode attn_prior or self_attn_bottomk
+--sampling_inputs                 applies only to --experiment_mode attn_prior or self_attn
 --attn_layers                     affects point selection for Exp 5/6/7 and attention map saving for all experiments
---dense_cross_attn_mode           active only for --experiment_mode dense_cross_attn
---attn_prior_mode                 active only for --experiment_mode attn_prior
+--attention_aggregate_function    applies to Exp 5/6/7 for attention map aggregation
+--attn_sampling_mode              applies to Exp 5/6/7 for point selection from attention maps
 ```
 
 ---
@@ -569,11 +535,11 @@ Both use `return_pre_softmax=True, average_attn_weights=True` internally — raw
 | 3b — matcher + fusion features | `--experiment_mode matcher --nshot N --use_fused_matcher_features` |
 | 3c — matcher + structured sampling | `--experiment_mode matcher --nshot N [--use_fused_matcher_features] --sampling k-medoids-points` |
 | 4 — query self-matching (failed) | `--experiment_mode self_matching --nshot N` |
-| 5a — attention prior topk | `--experiment_mode attn_prior --nshot N --attn_prior_mode topk_sampling --attn_layers last` |
-| 5b — attention prior rerank | `--experiment_mode attn_prior --nshot N --attn_prior_mode rerank_matcher --attn_layers last` |
+| 5a — attention prior topk | `--experiment_mode attn_prior --nshot N --attn_sampling_mode top-k --attn_layers last` |
+| 5b — attention prior bottomk | `--experiment_mode attn_prior --nshot N --attn_sampling_mode bottom-k --attn_layers last` |
 | 5c — attention prior, text only sampling | `--experiment_mode attn_prior --nshot N --sampling_inputs text_only --attn_layers last` |
-| 6a — dense cross-attn topk | `--experiment_mode dense_cross_attn --nshot N --dense_cross_attn_mode topk_sampling --attn_layers all` |
-| 6b — dense cross-attn rerank | `--experiment_mode dense_cross_attn --nshot N --dense_cross_attn_mode rerank_matcher --attn_layers all` |
-| 7a — self-attn bottom-k (both) | `--experiment_mode self_attn_bottomk --nshot N --attn_layers last` |
-| 7b — self-attn bottom-k, text only | `--experiment_mode self_attn_bottomk --nshot N --sampling_inputs text_only --attn_layers last` |
-| 7c — self-attn bottom-k, support only | `--experiment_mode self_attn_bottomk --nshot N --sampling_inputs support_only --attn_layers last` |
+| 6a — dense cross-attn topk | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode top-k --attn_layers all` |
+| 6b — dense cross-attn bottomk | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode bottom-k --attn_layers all` |
+| 7a — self-attn bottom-k (both) | `--experiment_mode self_attn --nshot N --attn_sampling_mode bottom-k --attn_layers last` |
+| 7b — self-attn bottom-k, text only | `--experiment_mode self_attn --nshot N --sampling_inputs text_only --attn_layers last` |
+| 7c — self-attn bottom-k, support only | `--experiment_mode self_attn --nshot N --sampling_inputs support_only --attn_layers last` |

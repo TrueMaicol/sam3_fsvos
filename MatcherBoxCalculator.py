@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from sam3.model.encoder import pool_text_feat
+import re
 
 class MatcherBoxCalculator():
     def __init__(self, sam3_model=None, sam3_processor=None):
@@ -47,10 +48,14 @@ class MatcherBoxCalculator():
         self.number_query_patches_backward_matching = None
 
         # Attention map results — populated after each capture pass
-        self.last_cross_attn_map        = None  # [72, 72] float32 numpy — sum over all prompt tokens
-        self.last_cross_attn_text_map   = None  # [72, 72] float32 numpy — sum over text token columns
-        self.last_cross_attn_points_map = None  # [72, 72] float32 numpy — sum over visual/point token columns
-        self.last_self_attn_map         = None  # [72, 72] float32 numpy
+        self.last_cross_attn_map        = None  # [72, 72] float32 numpy — aggregated over all prompt tokens
+        self.last_cross_attn_text_map   = None  # [72, 72] float32 numpy — aggregated over text token columns
+        self.last_cross_attn_points_map = None  # [72, 72] float32 numpy — aggregated over visual/point token columns
+        self.all_cross_attn_maps         = None  # list of [72, 72] float32 numpy — aggregated over all prompt tokens
+        self.all_cross_attn_text_maps    = None  # list of [72, 72] float32 numpy — aggregated over text token columns
+        self.all_cross_attn_points_maps  = None  # list of [72, 72] float32 numpy — aggregated over visual/point token columns
+        self.last_self_attn_map         = None  # [72, 72] float32 numpy — aggregated over all token columns
+        self.all_self_attn_maps         = None  # list of [72, 72] float32 numpy - aggregated over all token columns
         self.last_num_text_tokens       = 0     # token boundary; set by callers for inference-path capture
     
     def _get_encoder_layers(self):
@@ -83,7 +88,9 @@ class MatcherBoxCalculator():
     def get_fused_image_features(self, image, text_prompt="visual", skip_coords=False,
                                   visual_prompt=None, visual_prompt_mask=None,
                                   attn_layers: str | None = None,
-                                  include_text_in_prompt: bool = True):
+                                  include_text_in_prompt: bool = True,
+                                  agg_function: str = "sum"
+                                  ):
         if self.processor is None:
             raise ValueError("sam3_processor must be provided to use fused features")
 
@@ -147,10 +154,8 @@ class MatcherBoxCalculator():
                     num_text_tokens = 0
                 else:
                     num_text_tokens = text_outputs["language_features"].shape[0] if "language_features" in text_outputs else 0
-                self._store_cross_attn_maps(attn_layers, num_text_tokens)
-                self.last_self_attn_map = self.read_self_attn_map(attn_layers)
-                for layer in target_layers:
-                    layer.last_self_attn_weights = None
+                self._store_cross_attn_maps(attn_layers, num_text_tokens, agg_function)
+                self._store_self_attn_maps(attn_layers, agg_function)
 
             feat = encoder_out["encoder_hidden_states"].squeeze(1).float()
             feat = F.normalize(feat, dim=1, p=2)
@@ -164,7 +169,9 @@ class MatcherBoxCalculator():
                                   text_prompt="visual", skip_coords=False,
                                   attn_layers="last",
                                   visual_prompt=None, visual_prompt_mask=None,
-                                  skip_text_injection=False):
+                                  skip_text_injection=False,
+                                  agg_function: str = "sum"
+                                  ):
         """
         Exp 6: Run a dense cross-attention pass where the Fusion Encoder's self-attention
         attends to foreground support patches instead of image self-patches.
@@ -209,6 +216,7 @@ class MatcherBoxCalculator():
             # The Fusion Encoder adds a class-specific pooled-text bias to every image patch
             # before its self-attention layers. We apply the same here to support features so
             # both Query (Q) and Support (K/V) have the same text-conditioning.
+            # !!!! encoder.add_pooled_text_to_img_feat is hardcoded to false inside SAM3 source code !!!! #
             if not skip_text_injection and encoder.add_pooled_text_to_img_feat:
                 text_feats = text_outputs["language_features"]  # [L, 1, 256]
                 text_mask  = text_outputs["language_mask"]       # [1, L]
@@ -281,33 +289,16 @@ class MatcherBoxCalculator():
                 layer.capture_cross_attn_weights = False
 
         # --- Step 5: Collect and aggregate pre-softmax self-attn logits (dense support) ---
-        layer_maps = []
-        for layer in target_layers:
-            logits = layer.last_self_attn_weights
-            layer.last_self_attn_weights = None
-            if logits is not None:
-                # logits shape: [1, 5184, K] (batch=1, num_query_patches, num_support_patches)
-                # Sum over support patches → [1, 5184] → [5184]
-                relevance = logits.sum(dim=-1).squeeze(0)
-                layer_maps.append(relevance)
+        self._store_self_attn_maps(attn_layers, agg_function)
+        self._store_cross_attn_maps(attn_layers, num_text_tokens, agg_function)
 
-        if not layer_maps:
+        if self.last_self_attn_map is None:
             print("[DenseCA] WARNING: no pre-softmax logits captured — returning zero heatmap")
             return np.zeros((self.encoder_feat_size, self.encoder_feat_size), dtype=np.float32)
 
-        # Mean over captured layers → [5184]
-        # heatmap_flat = torch.stack(layer_maps, dim=0).mean(dim=0)
-        # heatmap_2d = heatmap_flat.reshape(
-        #     self.encoder_feat_size, self.encoder_feat_size
-        # ).cpu().float().numpy()
-        heatmap_2d = self._flat_to_2d(layer_maps)
-        print(f"[DenseCA] heatmap range: [{heatmap_2d.min():.3f}, {heatmap_2d.max():.3f}]")
+        print(f"[DenseCA] heatmap range: [{self.last_self_attn_map.min():.3f}, {self.last_self_attn_map.max():.3f}]")
 
-        # Store all attention maps for this pass
-        self.last_self_attn_map = heatmap_2d
-        self._store_cross_attn_maps(attn_layers, num_text_tokens)
-
-        return heatmap_2d
+        return self.last_self_attn_map
 
     def read_cross_attn_map(self, attn_layers: str = "last"):
         """Aggregate pre-softmax cross-attn weights stored from the last forward pass.
@@ -315,29 +306,14 @@ class MatcherBoxCalculator():
         Requires capture_cross_attn_weights=True on the target layers before that pass.
         Returns a float32 numpy array of shape [72, 72], or None if no weights were captured.
         """
-        all_layers = self._get_encoder_layers()
-        target_layers = [all_layers[-1]] if attn_layers == "last" else list(all_layers)
-
-        layer_maps = []
-        for layer in target_layers:
-            if layer.last_cross_attn_weights is not None:
-                # shape [1, 5184, seq_prompt] → sum over prompt tokens → [5184]
-                relevance = layer.last_cross_attn_weights.sum(dim=-1).squeeze(0)
-                layer_maps.append(relevance)
-
-        if not layer_maps:
+        if self.last_cross_attn_map is None:
             print("[SaveAttn] No pre-softmax cross-attn weights found — was capture_cross_attn_weights set?")
             return None
 
-        # heatmap_flat = torch.stack(layer_maps, dim=0).mean(dim=0)  # [5184]
-        # heatmap_2d = heatmap_flat.reshape(
-        #     self.encoder_feat_size, self.encoder_feat_size
-        # ).cpu().float().numpy()
-        heatmap_2d = self._flat_to_2d(layer_maps)
-        print(f"[SaveAttn] cross-attn heatmap range: [{heatmap_2d.min():.3f}, {heatmap_2d.max():.3f}]")
-        return heatmap_2d
+        print(f"[SaveAttn] cross-attn heatmap range: [{self.last_cross_attn_map.min():.3f}, {self.last_cross_attn_map.max():.3f}]")
+        return self.last_cross_attn_map
 
-    def read_self_attn_map(self, attn_layers: str = "last"):
+    def read_self_attn_map(self, attn_layers: str = "last", agg_function: str = "sum"):
         """Aggregate pre-softmax self-attn weights stored from the last forward pass.
 
         Requires capture_self_attn_weights=True on the target layers before that pass.
@@ -345,35 +321,45 @@ class MatcherBoxCalculator():
         cross-attention to support patches (Exp 6, when dense_support_feats was injected).
         Returns a float32 numpy array of shape [72, 72], or None if no weights were captured.
         """
-        all_layers = self._get_encoder_layers()
-        target_layers = [all_layers[-1]] if attn_layers == "last" else list(all_layers)
-
-        layer_maps = []
-        for layer in target_layers:
-            if layer.last_self_attn_weights is not None:
-                # shape [1, 5184, src_len] → sum over src dim → [5184]
-                relevance = layer.last_self_attn_weights.sum(dim=-1).squeeze(0)
-                layer_maps.append(relevance)
-
-        if not layer_maps:
+        if self.last_self_attn_map is None:
             print("[SaveAttn] No pre-softmax self-attn weights found — was capture_self_attn_weights set?")
             return None
 
-        # heatmap_flat = torch.stack(layer_maps, dim=0).mean(dim=0)  # [5184]
-        # heatmap_2d = heatmap_flat.reshape(
-        #     self.encoder_feat_size, self.encoder_feat_size
-        # ).cpu().float().numpy()
-        heatmap_2d = self._flat_to_2d(layer_maps)
-        print(f"[SaveAttn] self-attn heatmap range: [{heatmap_2d.min():.3f}, {heatmap_2d.max():.3f}]")
-        return heatmap_2d
+        print(f"[SaveAttn] self-attn heatmap range: [{self.last_self_attn_map.min():.3f}, {self.last_self_attn_map.max():.3f}]")
+        return self.last_self_attn_map
 
-    def _flat_to_2d(self, flat_array):
-        if not flat_array:
+    def _reshape_flat_to_2d(self, array):
+        return array.reshape(self.encoder_feat_size, self.encoder_feat_size).cpu().float().numpy()
+
+    def _flat_to_2d(self, attn_map_list):
+        if not attn_map_list:
             return None
-        flat = torch.stack(flat_array, dim=0).mean(dim=0)
-        return flat.reshape(self.encoder_feat_size, self.encoder_feat_size).cpu().float().numpy()
+        flat = torch.stack(attn_map_list, dim=0).mean(dim=0)
+        return self._reshape_flat_to_2d(flat)
 
-    def _store_cross_attn_maps(self, attn_layers: str, num_text_tokens: int):
+    def _aggregate_over_key(self, x: torch.Tensor, agg_function):
+        pattern = r"top-(\d+)-mean"
+
+        if agg_function == "mean":
+            return x.mean(dim=-1).squeeze(0)
+        if agg_function == "max":
+            return x.max(dim=-1)[0].squeeze(0)
+        if agg_function == "min":
+            return x.min(dim=-1)[0].squeeze(0)
+        else:
+            match = re.match(pattern, agg_function)
+            if match:
+                k = int(match.group(1))
+                if k > x.shape[1]:
+                    k = x.shape[1]
+                    print(f"[MatcherBoxCalculator] k={k} is larger than the number of keys ({x.shape[1]}), setting k to the number of keys")
+                topk_vals = torch.topk(x, k, dim=-1)[0]
+                return topk_vals.mean(dim=-1).squeeze(0)
+            else:
+                print(f"[MatcherBoxCalculator] Invalid agg_function={agg_function}, fallback to sum")
+                return x.sum(dim=-1).squeeze(0)
+
+    def _store_cross_attn_maps(self, attn_layers: str, num_text_tokens: int, agg_function: str):
         """Read last_cross_attn_weights from target layers, split by token type, store all three maps.
         Clears last_cross_attn_weights after reading.
 
@@ -385,22 +371,71 @@ class MatcherBoxCalculator():
         total_maps = []
         text_maps  = []
         pts_maps   = []
-        for layer in targets:
+        all_cross_maps = [None] * len(all_layers)
+        all_cross_text_maps = [None] * len(all_layers)
+        all_cross_pts_maps = [None] * len(all_layers)
+
+        for idx, layer in enumerate(all_layers):
+            if layer not in targets:
+                continue
             w = layer.last_cross_attn_weights  # [1, 5184, seq_prompt] or None
             layer.last_cross_attn_weights = None
             if w is None:
                 continue
-            total_maps.append(w.sum(dim=-1).squeeze(0))
-            if num_text_tokens > 0:
-                text_maps.append(w[..., :num_text_tokens].sum(dim=-1).squeeze(0))
-            if w.shape[-1] > num_text_tokens:
-                pts_maps.append(w[..., num_text_tokens:].sum(dim=-1).squeeze(0))
+            
+            agg_total = self._aggregate_over_key(w, agg_function)
+            total_maps.append(agg_total)
+            all_cross_maps[idx] = self._reshape_flat_to_2d(agg_total)
 
-        self.last_cross_attn_map        = self._flat_to_2d(total_maps)
-        self.last_cross_attn_text_map   = self._flat_to_2d(text_maps)
-        self.last_cross_attn_points_map = self._flat_to_2d(pts_maps)
+            if num_text_tokens > 0:
+                agg_text = self._aggregate_over_key(w[..., :num_text_tokens], agg_function)
+                text_maps.append(agg_text)
+                all_cross_text_maps[idx] = self._reshape_flat_to_2d(agg_text)
+            
+            if w.shape[-1] > num_text_tokens:
+                agg_pts = self._aggregate_over_key(w[..., num_text_tokens:], agg_function)
+                pts_maps.append(agg_pts)
+                all_cross_pts_maps[idx] = self._reshape_flat_to_2d(agg_pts)
+
+        # Store all the individual attention maps synced with layer indices
+        self.all_cross_attn_maps         = all_cross_maps
+        self.all_cross_attn_text_maps    = all_cross_text_maps
+        self.all_cross_attn_points_maps  = all_cross_pts_maps
+        # Store the aggregated (across layers) attention map
+        self.last_cross_attn_map         = self._flat_to_2d(total_maps)
+        self.last_cross_attn_text_map    = self._flat_to_2d(text_maps)
+        self.last_cross_attn_points_map  = self._flat_to_2d(pts_maps)
         if self.last_cross_attn_map is None:
             print("[SaveAttn] No cross-attn weights found — was capture_cross_attn_weights set?")
+
+    def _store_self_attn_maps(self, attn_layers: str, agg_function: str):
+        """Read last_self_attn_weights from target layers and store the map.
+        Clears last_self_attn_weights after reading.
+        """
+        all_layers = self._get_encoder_layers()
+        targets = [all_layers[-1]] if attn_layers == "last" else list(all_layers)
+
+        total_maps = []
+        all_self_maps = [None] * len(all_layers)
+
+        for idx, layer in enumerate(all_layers):
+            if layer not in targets:
+                continue
+            w = layer.last_self_attn_weights  # [1, 5184, seq_prompt] or None
+            layer.last_self_attn_weights = None
+            if w is None:
+                continue
+            
+            agg_total = self._aggregate_over_key(w, agg_function)
+            total_maps.append(agg_total)
+            all_self_maps[idx] = self._reshape_flat_to_2d(agg_total)
+
+        # Store all the individual attention maps synced with layer indices
+        self.all_self_attn_maps = all_self_maps
+        # Store the aggregated (across layers) attention map
+        self.last_self_attn_map = self._flat_to_2d(total_maps)
+        if self.last_self_attn_map is None:
+            print("[SaveAttn] No self-attn weights found — was capture_self_attn_weights set?")
 
     def arm_inference_capture(self, attn_layers: str):
         """Set capture flags on encoder layers before the inference forward pass."""
@@ -410,10 +445,11 @@ class MatcherBoxCalculator():
             layer.capture_cross_attn_weights = True
             layer.capture_self_attn_weights  = True
 
-    def collect_inference_attn(self, attn_layers: str, num_text_tokens: int):
+    def collect_inference_attn(self, attn_layers: str, num_text_tokens: int, agg_function: str):
         """Read and store maps captured during the inference pass; clear flags and tensors."""
-        self._store_cross_attn_maps(attn_layers, num_text_tokens)
-        self.last_self_attn_map = self.read_self_attn_map(attn_layers)
+        self._store_cross_attn_maps(attn_layers, num_text_tokens, agg_function)
+        self._store_self_attn_maps(attn_layers, agg_function)
+        # self.last_self_attn_map = self.read_self_attn_map(attn_layers, agg_function)
         all_layers = self._get_encoder_layers()
         targets = [all_layers[-1]] if attn_layers == "last" else list(all_layers)
         for layer in targets:
@@ -421,7 +457,7 @@ class MatcherBoxCalculator():
             layer.capture_self_attn_weights  = False
             layer.last_self_attn_weights     = None
 
-    def compute_box(self, reference_image=None, target_image=None, reference_mask=None, text_prompt="visual", use_fused_matcher_features=False, skip_coords=False, use_query_self_matching=False, reference_visual_prompt=None, reference_visual_mask=None, use_attn_prior_rerank=False, attn_layers="last"):
+    def compute_box(self, reference_image=None, target_image=None, reference_mask=None, text_prompt="visual", use_fused_matcher_features=False, skip_coords=False, use_query_self_matching=False, reference_visual_prompt=None, reference_visual_mask=None, attn_layers="last"):
         if reference_image is None or target_image is None:
             raise ValueError("Reference or Target image is not specified")
 
@@ -488,29 +524,6 @@ class MatcherBoxCalculator():
         matched_features = results[7]
         all_target_features = results[8]
         matched_indices_in_all = results[9]
-
-        # Rerank matched points by cross-attention localization prior
-        if use_attn_prior_rerank and len(points) > 0:
-            self.get_fused_image_features(
-                target_image,
-                text_prompt=text_prompt,
-                visual_prompt=reference_visual_prompt,
-                visual_prompt_mask=reference_visual_mask,
-                attn_layers=attn_layers,
-            )
-            # Use visual/points prior map for reranking (excludes text-token columns)
-            pts_map = self.last_cross_attn_points_map  # [72, 72] numpy or None
-            if pts_map is not None:
-                H = W = self.encoder_feat_size  # 72
-                pts_arr = np.array(points)
-                px = (pts_arr[:, 0] / self.encoder_patch_size).astype(int).clip(0, W - 1)
-                py = (pts_arr[:, 1] / self.encoder_patch_size).astype(int).clip(0, H - 1)
-                attn_scores = pts_map[py, px]
-                order = np.argsort(attn_scores)[::-1]
-                points = pts_arr[order]
-                matched_features = matched_features[order]
-                matched_indices_in_all = matched_indices_in_all[order]
-                print(f"[AttnRerank] reranked {len(points)} points by cross-attention prior")
 
         return box, points, matched_features, all_target_features, matched_indices_in_all
 
