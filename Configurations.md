@@ -69,6 +69,24 @@ The key design levers are:
 | `--skip_coords` | bool | False | Skip spatial coordinate embeddings when encoding point prompts. When False, the exemplar encoder receives both appearance and position information; when True, position is dropped |
 | `--use_query_as_support` | bool | False | Use the query image itself as the support image (1-shot self-support). Incompatible with `--experiment_mode matcher` and `--experiment_mode self_matching` |
 
+### Support Prompt Type
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--support_prompt_type` | str | `points` | Type of visual prompt built from support images. `points`: random points sampled from the GT mask (default). `box`: bounding box of the largest connected foreground blob, encoded via the geometry encoder's ROI-align path. Applies to `--experiment_mode random` (direct support encoding) and `attn_prior` / `self_attn` (sampling pass). |
+
+**`--support_prompt_type` choices:**
+
+| Value | Description |
+|-------|-------------|
+| `points` | Random points from support GT mask — scattered spatial tokens, each capturing a point's appearance and (unless `--skip_coords`) position |
+| `box` | Bounding box of the largest connected blob in the support mask. The geometry encoder encodes the box as a single token (or two corner tokens if `encode_boxes_as_points=True`) using ROI-align pooling to aggregate visual content within the box region. When `--skip_coords` is False, coordinate embeddings are also added; when True, only the ROI-pooled visual content is encoded |
+
+**Notes:**
+- With `--support_prompt_type box`, connected-components is always run and the **largest blob** is selected — even if only one blob is present.
+- Incompatible with `--sampling_inputs text_only` (no visual tokens are built in that mode).
+- Not applicable to `--experiment_mode matcher`, `self_matching`, or `dense_cross_attn`.
+
 ### Experiment Selector
 
 | Flag | Type | Default | Description |
@@ -113,11 +131,11 @@ The key design levers are:
 | `--attention_aggregate_function` | str | `sum` | Aggregation function used to aggregate attention matrices on the key dimension. Choices: `sum`, `mean`, `max`, `min`, `top-*-mean` (e.g. `top-5-mean`) |
 | `--attn_sampling_mode` | str | `top-k` | Point sampling method for attention priors. Choices: `top-k`, `bottom-k` |
 
-### Dense Cross-Attention Sub-options (Experiment 6)
+### Text Pooling Injection (Experiments 5, 6, 7)
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--dense_cross_attn_skip_text_injection` | bool | False | Skip the pooled-text→image-patch injection before the Fusion Encoder, so query features are purely visual during the dense cross-attention pass |
+| `--inject_text_pooling` | bool | False | If set, add the mean-pooled text embedding (after projection) as a bias to every image patch **before** the Fusion Encoder self-attention layers. Applies to **all** experiments that run a Fusion Encoder pass (Exp 5, 6, and 7). Mirrors the text conditioning applied during SAM3 training. Both query patches and support backbone features receive the same bias for symmetry. Defaults to False — standard behaviour (no injection). |
 
 ### Sampling Pass Input Control (Experiments 5 and 7)
 
@@ -186,6 +204,8 @@ Enforced by `validate_args()` at startup — invalid combinations raise an excep
 | `--experiment_mode dense_cross_attn` requires `--nshot > 0` |
 | `--experiment_mode self_attn --sampling_inputs support_only` requires `--nshot > 0` |
 | `--sampling_inputs text_only\|support_only` only applies to `--experiment_mode attn_prior` or `self_attn` |
+| `--support_prompt_type box` is incompatible with `--sampling_inputs text_only` |
+| `--support_prompt_type box` only applies to `--experiment_mode attn_prior`, `self_attn`, or `random` |
 
 ---
 
@@ -197,6 +217,7 @@ Enforced by `validate_args()` at startup — invalid combinations raise an excep
 ```
 --experiment_mode random
 --nshot N
+[--support_prompt_type points|box]
 [--disable_text]
 [--skip_coords]
 ```
@@ -204,17 +225,22 @@ Enforced by `validate_args()` at startup — invalid combinations raise an excep
 **Flow:**
 ```
 For each support image:
-    sample --num_points_from_mask random points from GT mask
-    encode points via SAM3 exemplar encoder
-        (--skip_coords: drop spatial info from encoding)
-Aggregate all support point embeddings → visual prompt
+    if --support_prompt_type points (default):
+        sample --num_points_from_mask random points from GT mask
+        encode points via SAM3 geometry encoder → 1 token per point
+    if --support_prompt_type box:
+        run connected-components on GT mask → select largest blob
+        compute bounding box [cx, cy, w, h] (normalized [0,1])
+        encode box via SAM3 geometry encoder (ROI-align) → 1 token per support image
+        (--skip_coords: use ROI-align content only, drop coordinate embeddings)
+Aggregate all support tokens → visual prompt
 Combine with text label tokens (unless --disable_text)
     → final prompt fed to Fusion Encoder on query image
 Fusion Encoder: query patches cross-attend to final prompt
 SAM3 decoder → mask
 ```
 
-**Notes:** The visual prompt encodes *where* and *what* is in the support. `--skip_coords` tests whether removing spatial information hurts (it typically does, because the exemplar encoder partially encodes object appearance via position).
+**Notes:** The visual prompt encodes *where* and *what* is in the support. `--skip_coords` tests whether removing spatial information hurts (it typically does, because the exemplar encoder partially encodes object appearance via position). With `--support_prompt_type box`, a single ROI-pooled token represents the whole object region, collapsing N scattered point tokens into one holistic representation.
 
 ---
 
@@ -375,7 +401,7 @@ Does NOT use the bipartite matcher. Does NOT go through `--sampling` (the attent
 --attn_layers all | last
 --attention_aggregate_function sum | mean | max | min | top-*-mean
 --attn_sampling_mode top-k | bottom-k
-[--dense_cross_attn_skip_text_injection]
+[--inject_text_pooling]
 ```
 
 **Motivation:** In the standard pipeline, the query image only sees the support object through a compressed visual prompt in the Fusion Encoder's cross-attention. Experiment 6 replaces the Fusion Encoder's self-attention with a dense cross-attention where the query image patches directly attend to the support object's foreground patches at patch resolution, enabling explicit patch-level correspondence.
@@ -429,6 +455,7 @@ Does NOT use the bipartite matcher. The heatmap ranking is the final selection �
 --attention_aggregate_function sum | mean | max | min | top-*-mean
 --attn_sampling_mode top-k | bottom-k
 [--sampling_inputs both | text_only | support_only]
+[--support_prompt_type points|box]
 ```
 
 **Motivation:** The Fusion Encoder's self-attention map (standard Q=K=V=query patches) empirically shows low row-sum values at the target object's location. Experiment 7 exploits this by selecting the k query patches with the *lowest* self-attention activation as prompt points, bypassing explicit cross-image matching entirely.
@@ -446,14 +473,19 @@ All weights are **pre-softmax** raw scaled dot-products averaged over heads. Thi
 
 **Flow:**
 ```
-Resolve sampling-pass inputs from --sampling_inputs:
-    both:         run Fusion Encoder with text label + support visual tokens
-    text_only:    run Fusion Encoder with text label only (no visual_prompt)
-    support_only: run Fusion Encoder with support visual tokens only (no text in cross-attn)
+Resolve sampling-pass inputs:
+    --sampling_inputs both:         run Fusion Encoder with text label + support visual tokens
+    --sampling_inputs text_only:    run Fusion Encoder with text label only (no visual_prompt)
+    --sampling_inputs support_only: run Fusion Encoder with support visual tokens only
+
+    Support visual tokens built from (when sampling_inputs is both or support_only):
+        --support_prompt_type points (default): random points from GT mask
+        --support_prompt_type box:              bounding box of largest blob (ROI-align token)
 
 Run Fusion Encoder on query — capture self-attn weights
 Construct self-attention heatmap [5184] from target layers
-Sample patches based on --attn_sampling_mode (top-k or bottom-k, k=--num_points_from_mask) → patch indices → pixel centers → normalized coords
+Sample patches based on --attn_sampling_mode (top-k or bottom-k, k=--num_points_from_mask)
+    → patch indices → pixel centers → normalized coords
 Convert patch index → pixel center: px = (idx % 72) * 14 + 7,  py = (idx // 72) * 14 + 7
 Normalize: [px / 1008, py / 1008]
 
@@ -465,8 +497,11 @@ Does NOT use the bipartite matcher or the cross-attention map. `--sampling` is n
 
 **`--sampling_inputs` ablation purpose:**
 - `both` (default): replicates the full prompt context used in inference; tests whether the self-attention map is driven by the combined signal
-- `text_only`: isolates the contribution of the text label to the self-attention localization
+- `text_only`: isolates the contribution of the text label to the self-attention localization (incompatible with `--support_prompt_type box`)
 - `support_only`: isolates the contribution of the support visual tokens
+
+**`--support_prompt_type box` ablation purpose:**
+Tests whether a holistic ROI-pooled box token (capturing the whole object region) produces a more focused self-attention prior than a set of scattered point tokens.
 
 ---
 
@@ -502,10 +537,11 @@ Both use `return_pre_softmax=True, average_attn_weights=True` internally — raw
     --sampling_inputs             controls fusion encoder inputs in sampling pass
     --attention_aggregate_function controls aggregation of attention matrices
     --attn_sampling_mode          top-k (default) or bottom-k
+    --inject_text_pooling         optional — add pooled-text bias to image patches
 
 --experiment_mode dense_cross_attn
     requires: --nshot > 0
-    --dense_cross_attn_skip_text_injection  optional
+    --inject_text_pooling         optional — add pooled-text bias to query and support patches
     --attn_layers                 last (default) or all
     --attention_aggregate_function controls aggregation of attention matrices
     --attn_sampling_mode          top-k (default) or bottom-k
@@ -516,6 +552,14 @@ Both use `return_pre_softmax=True, average_attn_weights=True` internally — raw
     --sampling_inputs support_only requires --nshot > 0
     --attention_aggregate_function controls aggregation of attention matrices
     --attn_sampling_mode          top-k or bottom-k (default)
+    --support_prompt_type         points (default) or box; incompatible with sampling_inputs=text_only
+    --inject_text_pooling         optional — add pooled-text bias to image patches
+
+--experiment_mode attn_prior
+    --support_prompt_type         points (default) or box; incompatible with sampling_inputs=text_only
+
+--experiment_mode random
+    --support_prompt_type         points (default) or box
 
 --sampling_inputs                 applies only to --experiment_mode attn_prior or self_attn
 --attn_layers                     affects point selection for Exp 5/6/7 and attention map saving for all experiments
@@ -540,6 +584,12 @@ Both use `return_pre_softmax=True, average_attn_weights=True` internally — raw
 | 5c — attention prior, text only sampling | `--experiment_mode attn_prior --nshot N --sampling_inputs text_only --attn_layers last` |
 | 6a — dense cross-attn topk | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode top-k --attn_layers all` |
 | 6b — dense cross-attn bottomk | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode bottom-k --attn_layers all` |
+| 6a+text — dense cross-attn topk + text pooling | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode top-k --attn_layers all --inject_text_pooling` |
+| 6b+text — dense cross-attn bottomk + text pooling | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode bottom-k --attn_layers all --inject_text_pooling` |
 | 7a — self-attn bottom-k (both) | `--experiment_mode self_attn --nshot N --attn_sampling_mode bottom-k --attn_layers last` |
 | 7b — self-attn bottom-k, text only | `--experiment_mode self_attn --nshot N --sampling_inputs text_only --attn_layers last` |
 | 7c — self-attn bottom-k, support only | `--experiment_mode self_attn --nshot N --sampling_inputs support_only --attn_layers last` |
+| 1-box — random + box support | `--experiment_mode random --nshot N --support_prompt_type box` |
+| 5-box — attn prior + box support | `--experiment_mode attn_prior --nshot N --attn_sampling_mode top-k --attn_layers last --support_prompt_type box` |
+| 7-box — self-attn + box support (both) | `--experiment_mode self_attn --nshot N --attn_sampling_mode bottom-k --attn_layers last --sampling_inputs both --support_prompt_type box` |
+| 7-box-all — self-attn + box support (all layers) | `--experiment_mode self_attn --nshot N --attn_sampling_mode bottom-k --attn_layers all --sampling_inputs both --support_prompt_type box` |

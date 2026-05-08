@@ -28,33 +28,33 @@ BENCHMARKS = [
 
 EXPERIMENTS = [
     "1_SHOT_CROSS_ATTN_5_POINTS_TOP_K_ALL_LAYERS",
-    # "1_SHOT_CROSS_ATTN_5_POINTS_TOP_K_LAST_LAYER",
+    "1_SHOT_CROSS_ATTN_5_POINTS_TOP_K_LAST_LAYER",
     "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_ONLY_ALL_LAYERS",
-    # "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_ONLY_LAST_LAYER",
-    "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_ONLY_ALL_LAYERS_AGGR_MAX",
-    # "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_ONLY_LAST_LAYER_AGGR_MAX",
+    "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_ONLY_LAST_LAYER",
     "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_SUPPORT_ALL_LAYERS",
-    # "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_SUPPORT_LAST_LAYER",
-    "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_SUPPORT_ALL_LAYERS_AGGR_MAX",
-    # "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_SUPPORT_LAST_LAYER_AGGR_MAX",
+    "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_SUPPORT_LAST_LAYER",
+    "1_SHOT_SELF_ATTN_TOPK_5_POINTS_TEXT_ONLY_ALL_LAYERS_AGGR_MAX",
+    "1_SHOT_SELF_ATTN_TOPK_5_POINTS_TEXT_ONLY_LAST_LAYER_AGGR_MAX",
+    "1_SHOT_SELF_ATTN_TOPK_5_POINTS_TEXT_SUPPORT_ALL_LAYERS_AGGR_MAX",
+    "1_SHOT_SELF_ATTN_TOPK_5_POINTS_TEXT_SUPPORT_LAST_LAYER_AGGR_MAX",
     "1_SHOT_MATCHER_5_POINTS_FUSED_K_MEDOIDS_POINTS",
     "1_SHOT_5_POINTS_QUERY_AS_SUPPORT",
     # add more experiment folder names here
 ]
 
 EXPERIMENT_NAMES = [
-    "CROSS_ATTN_ALL_LAYERS",
-    # "CROSS_ATTN_LAST_LAYER",
-    "SELF_ATTN_TEXT_ONLY_ALL_LAYERS",
-    # "SELF_ATTN_TEXT_ONLY_LAST_LAYER",
-    "SELF_ATTN_TEXT_ONLY_ALL_LAYERS_AGGR_MAX",
-    # "SELF_ATTN_TEXT_ONLY_LAST_LAYER_AGGR_MAX",
-    "SELF_ATTN_TEXT_SUPPORT_ALL_LAYERS",
-    # "SELF_ATTN_TEXT_SUPPORT_LAST_LAYER",
-    "SELF_ATTN_TEXT_SUPPORT_ALL_LAYERS_AGGR_MAX",
-    # "SELF_ATTN_TEXT_SUPPORT_LAST_LAYER_AGGR_MAX",
-    "MATCHER_5_POINTS_FUSED_K_MEDOIDS_POINTS",
-    "QUERY_AS_SUPPORT",
+    "CROSS-ATTN TOP-K TEXT+SUPPORT ALL LAYERS",
+    "CROSS-ATTN TOP-K TEXT+SUPPORT LAST LAYERS",
+    "SELF-ATTN BOTTOM-K TEXT ONLY ALL LAYERS",
+    "SELF-ATTN BOTTOM-K TEXT ONLY LAST LAYERS",
+    "SELF-ATTN BOTTOM-K TEXT+SUPPORT ALL LAYERS",
+    "SELF-ATTN BOTTOM-K TEXT+SUPPORT LAST LAYERS",
+    "SELF-ATTN TOP-K TEXT ONLY ALL LAYERS AGGR MAX",
+    "SELF-ATTN TOP-K TEXT ONLY LAST LAYERS AGGR MAX",
+    "SELF-ATTN TOP-K TEXT+SUPPORT ALL LAYERS AGGR MAX",
+    "SELF-ATTN TOP-K TEXT+SUPPORT LAST LAYERS AGGR MAX",
+    "MATCHER FUSED K-MEDOIDS",
+    "QUERY AS SUPPORT",
 ]  # list of labels matching EXPERIMENTS order, or None to use folder names
 
 # Extra columns prepended to the attention-map columns.
@@ -142,26 +142,22 @@ def discover_frames(folder: str) -> dict:
                 key = str(rel / frame_tag)
                 frames.setdefault(key, {})[f"layer_{layer_num}_{ltype}"] = Path(attn_dir) / fname
 
-            # Resolve extra-column paths and matcher_points (once per key)
-            # if "__extra_resolved" not in frames[key]:
-            #     for col_label, rel_tmpl in EXTRA_COLUMNS:
-            #         col_path = sample_abs / rel_tmpl.format(frame_tag=frame_tag)
-            #         frames[key][col_label] = col_path if col_path.is_file() else None
-            #     matcher_path = sample_abs / "bounding_box" / f"frame_{frame_tag}_matcher_points.png"
-            #     frames[key]["MATCHER_POINTS"] = matcher_path if matcher_path.is_file() else None
-            #     frames[key]["__extra_resolved"] = True
+            # Resolve extra-column paths once per (key, frame_tag) pair
+            if "__extra_resolved" not in frames[key]:
+                for col_label, rel_tmpl in EXTRA_COLUMNS:
+                    col_path = sample_abs / rel_tmpl.format(frame_tag=frame_tag)
+                    frames[key][col_label] = col_path if col_path.is_file() else None
+                frames[key]["__extra_resolved"] = True
     return frames
 
 
-def _render_cell(ax, filepath, placeholder="not found"):
-    """Load and display an image in the given axes, or show a placeholder."""
+def _render_cell(ax, filepath):
+    """Load and display an image in the given axes, or show a neutral grey placeholder."""
     if filepath is not None and Path(filepath).is_file():
         img = np.array(Image.open(filepath).convert("RGB"))
         ax.imshow(img, aspect="auto")
     else:
-        ax.set_facecolor("#cccccc")
-        ax.text(0.5, 0.5, placeholder, ha="center", va="center",
-                transform=ax.transAxes, fontsize=8, color="#555555")
+        ax.set_facecolor("#dddddd")
 
 
 def _layer_label(col_key: str) -> str:
@@ -171,63 +167,167 @@ def _layer_label(col_key: str) -> str:
 
 
 def make_comparison(tag: str, per_exp_frames: list, exp_names: list, output_path: Path):
+    """Always saves a flat comparison (aggregated maps).
+    Additionally saves a layered comparison (per-layer maps) when layer data is present."""
     extra_labels = [label for label, _ in EXTRA_COLUMNS]
+    has_layers = any(any(k.startswith("layer_") for k in f) for f in per_exp_frames)
 
-    per_layer_cols = [
-        f"layer_{n}_{t}"
-        for t in LAYER_TYPES_ORDER
-        for n in range(N_LAYERS)
-    ]
+    # Always produce the flat (aggregated) figure
+    _make_comparison_flat(tag, per_exp_frames, exp_names, extra_labels, output_path)
 
-    has_layers = any(
-        any(k.startswith("layer_") for k in f) for f in per_exp_frames
-    )
-    # has_matcher = any(f.get("MATCHER_POINTS") is not None for f in per_exp_frames)
-
-    all_col_keys = list(extra_labels)
+    # Produce the per-layer figure alongside (different filename),
+    # keeping only experiments that actually have layer data.
     if has_layers:
-        all_col_keys += per_layer_cols
-    all_col_keys += list(ATTN_MAP_TYPES)
-    # if has_matcher:
-    #     all_col_keys += ["MATCHER_POINTS"]
+        layer_mask   = [any(k.startswith("layer_") for k in f) for f in per_exp_frames]
+        layer_frames = [f for f, m in zip(per_exp_frames, layer_mask) if m]
+        layer_names  = [n for n, m in zip(exp_names,      layer_mask) if m]
+        if layer_frames:
+            layers_path = output_path.with_name(output_path.stem + "_layers" + output_path.suffix)
+            _make_comparison_layered(tag, layer_frames, layer_names, layers_path)
 
-    all_col_labels = list(extra_labels)
-    if has_layers:
-        all_col_labels += [_layer_label(c) for c in per_layer_cols]
-    all_col_labels += [t.replace("_", " ") for t in ATTN_MAP_TYPES]
-    # if has_matcher:
-    #     all_col_labels += ["MATCHER_POINTS"]
+
+def _make_comparison_flat(tag, per_exp_frames, exp_names, extra_labels, output_path):
+    """One row per experiment: overlay images + aggregated attention maps."""
+    all_col_keys   = list(extra_labels) + list(ATTN_MAP_TYPES)
+    all_col_labels = list(extra_labels) + [t.replace("_", " ") for t in ATTN_MAP_TYPES]
 
     num_rows = len(per_exp_frames)
     num_cols = len(all_col_keys)
+    label_margin_in = 1.8
+    figwidth = label_margin_in + CELL_SIZE_INCHES * num_cols
     fig, axes = plt.subplots(
         num_rows, num_cols,
-        figsize=(CELL_SIZE_INCHES * num_cols, CELL_SIZE_INCHES * num_rows),
-        dpi=100,
-        squeeze=False,
+        figsize=(figwidth, CELL_SIZE_INCHES * num_rows),
+        dpi=100, squeeze=False,
     )
 
-    for row_idx, (frames, exp_name) in tqdm(enumerate(zip(per_exp_frames, exp_names)), desc=f"map_type"):
+    for row_idx, (frames, _) in enumerate(zip(per_exp_frames, exp_names)):
         for col_idx, (col_key, col_label) in enumerate(zip(all_col_keys, all_col_labels)):
             ax = axes[row_idx][col_idx]
             ax.axis("off")
-
             _render_cell(ax, frames.get(col_key))
             if row_idx == 0:
                 ax.set_title(col_label, fontsize=10, pad=6)
 
-    # Fixed-inch left margin so cells stay square regardless of column count
-    label_margin_in = 1.8
-    left_frac = label_margin_in / (CELL_SIZE_INCHES * num_cols)
-    plt.tight_layout(rect=[left_frac, 0, 1, 0.99])
+    left_frac = label_margin_in / figwidth
+    plt.tight_layout(rect=(left_frac, 0, 1, 0.99))
     for row_idx, exp_name in enumerate(exp_names):
-        ax = axes[row_idx][0]
-        pos = ax.get_position()
+        pos = axes[row_idx][0].get_position()
         y_center = (pos.y0 + pos.y1) / 2
-        fig.text(left_frac - 0.005, y_center, exp_name, va="center", ha="right",
-                 rotation=0, fontsize=9, fontweight="bold")
+        fig.text(left_frac - 0.005, y_center, exp_name,
+                 va="center", ha="right", fontsize=9, fontweight="bold")
 
     fig.suptitle(tag, fontsize=11, y=0.995)
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _make_comparison_layered(tag, per_exp_frames, exp_names, output_path):
+    """Per-layer-only figure (Option-A layout).
+
+    Each experiment block = one sub-row per attention type in LAYER_TYPES_ORDER.
+    Columns = L0 … L{N_LAYERS-1}.  No summary row (see the flat figure for that).
+
+    Left margin:
+      • Outer band (rotated 90°): experiment name, large, centred over the block
+      • Inner band (horizontal):  attention-type label on each sub-row
+    Thick separator line + blank gap row between experiment blocks.
+    """
+    n_subrows  = len(LAYER_TYPES_ORDER)   # one sub-row per type (e.g. 4)
+    num_exp    = len(per_exp_frames)
+    # Insert one blank "gap" row between experiment blocks for breathing room
+    GAP_ROWS   = 1
+    rows_per_block = n_subrows + GAP_ROWS   # last block has no trailing gap
+    num_rows   = num_exp * n_subrows + (num_exp - 1) * GAP_ROWS
+    num_cols   = N_LAYERS
+
+    MARGIN_EXP_IN  = 1.8   # wider band → bigger font for exp name
+    MARGIN_TYPE_IN = 1.3
+    label_margin_in = MARGIN_EXP_IN + MARGIN_TYPE_IN
+
+    # Height ratios: data rows = 1, gap rows = 0.15
+    height_ratios = []
+    for exp_idx in range(num_exp):
+        height_ratios.extend([1.0] * n_subrows)
+        if exp_idx < num_exp - 1:
+            height_ratios.extend([0.15] * GAP_ROWS)
+
+    figheight = CELL_SIZE_INCHES * sum(height_ratios)
+    figwidth  = label_margin_in + CELL_SIZE_INCHES * num_cols
+    fig, axes = plt.subplots(
+        num_rows, num_cols,
+        figsize=(figwidth, figheight),
+        dpi=100, squeeze=False,
+        gridspec_kw={"height_ratios": height_ratios},
+    )
+
+    # Hide gap rows
+    for exp_idx in range(num_exp - 1):
+        gap_row = exp_idx * rows_per_block + n_subrows
+        for col in range(num_cols):
+            axes[gap_row][col].axis("off")
+            axes[gap_row][col].set_facecolor("white")
+
+    # ── Fill layer cells ──────────────────────────────────────────────────────
+    for exp_idx, (frames, _) in enumerate(zip(per_exp_frames, exp_names)):
+        base = exp_idx * rows_per_block
+        for ti, ltype in enumerate(LAYER_TYPES_ORDER):
+            row = base + ti
+            for col in range(num_cols):
+                ax = axes[row][col]
+                ax.axis("off")
+                _render_cell(ax, frames.get(f"layer_{col}_{ltype}"))
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    # Use subplots_adjust for precise control (avoids tight_layout+gridspec warning).
+    left_frac = label_margin_in / figwidth
+    fig.subplots_adjust(left=left_frac, right=0.99, top=0.975, bottom=0.015, hspace=0.08)
+
+    # After layout, query actual axes positions for pixel-accurate label placement.
+    axes_x0 = axes[0][0].get_position().x0   # true left edge of the axes area
+    x_type  = axes_x0 - 0.008                # type label: just left of axes
+    x_exp   = axes_x0 * 0.38                 # exp name:  in the outer margin band
+
+    # ── Column headers: L0 … L{N_LAYERS-1} above very first data row ─────────
+    for col in range(num_cols):
+        pos = axes[0][col].get_position()
+        fig.text((pos.x0 + pos.x1) / 2, pos.y1 + 0.004,
+                 f"L{col}", ha="center", va="bottom", fontsize=11, fontweight="bold")
+
+    # ── Left-margin labels ────────────────────────────────────────────────────
+    sub_row_labels = [lt.replace("_", " ") for lt in LAYER_TYPES_ORDER]
+
+    for exp_idx, exp_name in enumerate(exp_names):
+        base = exp_idx * rows_per_block
+
+        # Experiment name: large, rotated, centred over all sub-rows of this block
+        pos_top = axes[base][0].get_position()
+        pos_bot = axes[base + n_subrows - 1][0].get_position()
+        y_center = (pos_top.y1 + pos_bot.y0) / 2
+        fig.text(x_exp, y_center, exp_name,
+                 va="center", ha="center", rotation=90,
+                 fontsize=11, fontweight="bold")
+
+        # Sub-row type labels: placed using actual axes x0, so they never overlap
+        for sr_idx, sr_label in enumerate(sub_row_labels):
+            pos = axes[base + sr_idx][0].get_position()
+            y_c = (pos.y0 + pos.y1) / 2
+            fig.text(x_type, y_c, sr_label,
+                     va="center", ha="right", fontsize=9, color="#222222")
+
+    # ── Thick separator lines in the gap between experiment blocks ────────────
+    for exp_idx in range(num_exp - 1):
+        gap_row = exp_idx * rows_per_block + n_subrows
+        pos_gap = axes[gap_row][0].get_position()
+        y_mid = (pos_gap.y0 + pos_gap.y1) / 2
+        line = plt.Line2D(
+            [left_frac * 0.05, 1.0], [y_mid, y_mid],
+            transform=fig.transFigure,
+            color="#333333", linewidth=2.5, linestyle="-", clip_on=False,
+        )
+        fig.add_artist(line)
+
+    fig.suptitle(tag, fontsize=11, y=0.999)
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
 

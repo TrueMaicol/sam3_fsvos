@@ -565,9 +565,10 @@ class TransformerEncoderFusion(TransformerEncoder):
         if self.add_pooled_text_to_img_feat:
             self.text_pooling_proj = nn.Linear(d_model, d_model)
         self.pool_text_with_mask = pool_text_with_mask
-        # Runtime flag: set externally to True to skip the text pooling injection
-        # (e.g. during dense cross-attention experiments to avoid text bias on query patches)
-        self.skip_text_pooling_injection = False
+        # Runtime flag: set externally to True to add the pooled-text bias to every
+        # image patch before the Fusion Encoder self-attention layers.
+        # Defaults to False — standard behaviour is no injection.
+        self.inject_text_pooling = False
         if compile_mode is not None:
             self.forward = torch.compile(
                 self.forward, mode=compile_mode, fullgraph=True
@@ -608,8 +609,12 @@ class TransformerEncoderFusion(TransformerEncoder):
                 "expected list of (bs, c, h, w) tensors"
             )
 
-        if self.add_pooled_text_to_img_feat and not self.skip_text_pooling_injection:
+        # Inject pooled text into every image patch when the runtime flag requests it.
+        # add_pooled_text_to_img_feat is now always True (so text_pooling_proj exists),
+        # but injection is gated solely by inject_text_pooling (default False).
+        if self.inject_text_pooling:
             # Fusion: Add mean pooled text to image features
+            print("[FusionEncoder] Injecting text pooling into image features.")
             pooled_text = pool_text_feat(
                 prompt, prompt_key_padding_mask, self.pool_text_with_mask
             )

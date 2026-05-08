@@ -89,7 +89,8 @@ class MatcherBoxCalculator():
                                   visual_prompt=None, visual_prompt_mask=None,
                                   attn_layers: str | None = None,
                                   include_text_in_prompt: bool = True,
-                                  agg_function: str = "sum"
+                                  agg_function: str = "sum",
+                                  inject_text_pooling: bool = False,
                                   ):
         if self.processor is None:
             raise ValueError("sam3_processor must be provided to use fused features")
@@ -139,11 +140,15 @@ class MatcherBoxCalculator():
                     layer.capture_cross_attn_weights = True
                     layer.capture_self_attn_weights  = True
 
+            encoder = self.processor.model.transformer.encoder
+            if inject_text_pooling:
+                encoder.inject_text_pooling = True
             try:
                 backbone_out, encoder_out, _ = self.processor.model._run_encoder(
                     backbone_out, self.processor.find_stage, prompt, prompt_mask
                 )
             finally:
+                encoder.inject_text_pooling = False
                 for layer in target_layers:
                     layer.capture_cross_attn_weights = False
                     layer.capture_self_attn_weights  = False
@@ -169,7 +174,7 @@ class MatcherBoxCalculator():
                                   text_prompt="visual", skip_coords=False,
                                   attn_layers="last",
                                   visual_prompt=None, visual_prompt_mask=None,
-                                  skip_text_injection=False,
+                                  inject_text_pooling=False,
                                   agg_function: str = "sum"
                                   ):
         """
@@ -187,8 +192,9 @@ class MatcherBoxCalculator():
             attn_layers: "last" or "all" — which encoder layers to aggregate
             visual_prompt: optional pre-computed support visual prompt [L, 1, 256]
             visual_prompt_mask: optional support visual prompt mask [1, L]
-            skip_text_injection: if True, bypass the pooled-text→image-patch injection
-                in the Fusion Encoder so query patch features remain purely visual.
+            inject_text_pooling: if True, add the pooled-text bias to every image
+                patch (query and support) before the Fusion Encoder self-attention
+                layers, mirroring the conditioning applied during SAM3 training.
 
         Returns:
             heatmap_2d: np.ndarray [72, 72] of aggregated pre-softmax logits
@@ -216,8 +222,7 @@ class MatcherBoxCalculator():
             # The Fusion Encoder adds a class-specific pooled-text bias to every image patch
             # before its self-attention layers. We apply the same here to support features so
             # both Query (Q) and Support (K/V) have the same text-conditioning.
-            # !!!! encoder.add_pooled_text_to_img_feat is hardcoded to false inside SAM3 source code !!!! #
-            if not skip_text_injection and encoder.add_pooled_text_to_img_feat:
+            if inject_text_pooling:
                 text_feats = text_outputs["language_features"]  # [L, 1, 256]
                 text_mask  = text_outputs["language_mask"]       # [1, L]
                 pooled_text = pool_text_feat(
@@ -226,6 +231,7 @@ class MatcherBoxCalculator():
                 pooled_text = encoder.text_pooling_proj(pooled_text)  # [1, 256]
                 # Broadcast to [N, 256, 72, 72] and add to support spatial features
                 sup_feats_spatial = sup_feats_spatial + pooled_text.unsqueeze(-1).unsqueeze(-1)
+
 
         # --- Step 2: Pool support masks to 72x72 and select foreground patches ---
         if support_masks.ndim == 3:
@@ -270,8 +276,8 @@ class MatcherBoxCalculator():
             layer.capture_cross_attn_weights = True
 
         # --- Step 4: Run the encoder with dense support feats active ---
-        if skip_text_injection:
-            encoder.skip_text_pooling_injection = True
+        if inject_text_pooling:
+            encoder.inject_text_pooling = True
         try:
             self.get_fused_image_features(
                 query_img,
@@ -282,7 +288,7 @@ class MatcherBoxCalculator():
             )
         finally:
             # Always reset layer state and encoder flags regardless of exceptions
-            encoder.skip_text_pooling_injection = False
+            encoder.inject_text_pooling = False
             for layer in all_layers:
                 layer.dense_support_feats = None
                 layer.capture_self_attn_weights  = False
@@ -338,7 +344,7 @@ class MatcherBoxCalculator():
         return self._reshape_flat_to_2d(flat)
 
     def _aggregate_over_key(self, x: torch.Tensor, agg_function):
-        pattern = r"top-(\d+)-mean"
+        top_k_mean_pattern = r"top-(\d+)-mean"
 
         if agg_function == "mean":
             return x.mean(dim=-1).squeeze(0)
@@ -346,18 +352,20 @@ class MatcherBoxCalculator():
             return x.max(dim=-1)[0].squeeze(0)
         if agg_function == "min":
             return x.min(dim=-1)[0].squeeze(0)
+        if agg_function == "sum":
+            return x.sum(dim=-1).squeeze(0)
+        
+        match = re.match(top_k_mean_pattern, agg_function)
+        if match:
+            k = int(match.group(1))
+            if k > x.shape[1]:
+                k = x.shape[1]
+                print(f"[MatcherBoxCalculator] k={k} is larger than the number of keys ({x.shape[1]}), setting k to the number of keys")
+            topk_vals = torch.topk(x, k, dim=-1)[0]
+            return topk_vals.mean(dim=-1).squeeze(0)
         else:
-            match = re.match(pattern, agg_function)
-            if match:
-                k = int(match.group(1))
-                if k > x.shape[1]:
-                    k = x.shape[1]
-                    print(f"[MatcherBoxCalculator] k={k} is larger than the number of keys ({x.shape[1]}), setting k to the number of keys")
-                topk_vals = torch.topk(x, k, dim=-1)[0]
-                return topk_vals.mean(dim=-1).squeeze(0)
-            else:
-                print(f"[MatcherBoxCalculator] Invalid agg_function={agg_function}, fallback to sum")
-                return x.sum(dim=-1).squeeze(0)
+            print(f"[MatcherBoxCalculator] Invalid agg_function={agg_function}, fallback to sum")
+            return x.sum(dim=-1).squeeze(0)
 
     def _store_cross_attn_maps(self, attn_layers: str, num_text_tokens: int, agg_function: str):
         """Read last_cross_attn_weights from target layers, split by token type, store all three maps.

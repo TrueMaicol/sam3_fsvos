@@ -156,7 +156,11 @@ def _create_transformer_encoder(use_fa3=False) -> TransformerEncoderFusion:
         num_feature_levels=1,
         frozen=False,
         use_act_checkpoint=True,
-        add_pooled_text_to_img_feat=False,
+        # Always create text_pooling_proj so the runtime inject_text_pooling flag
+        # can use it without hitting an AttributeError.  The flag itself defaults to
+        # False, so injection is skipped unless explicitly requested — identical to
+        # the original add_pooled_text_to_img_feat=False behaviour.
+        add_pooled_text_to_img_feat=True,
         pool_text_with_mask=True,
     )
     return encoder

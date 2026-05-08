@@ -181,6 +181,27 @@ class Sam3Processor:
         return state
 
     @torch.inference_mode()
+    def add_box_prompts(self, box: List, label: bool, state: Dict):
+        """Adds a box prompt to the state without running inference.
+        box: [center_x, center_y, width, height] normalized in [0, 1].
+        label: True for positive box.
+        Mirrors add_point_prompts — call _encode_current_prompts separately.
+        """
+        if "backbone_out" not in state:
+            raise ValueError("You must call set_image before add_box_prompts")
+        if "language_features" not in state["backbone_out"]:
+            dummy_text_outputs = self.model.backbone.forward_text(
+                ["visual"], device=self.device
+            )
+            state["backbone_out"].update(dummy_text_outputs)
+        if "geometric_prompt" not in state:
+            state["geometric_prompt"] = self.model._get_dummy_prompt()
+        box_t = torch.tensor(box, device=self.device, dtype=torch.float32).view(1, 1, 4)
+        lbl_t = torch.tensor([label], device=self.device, dtype=torch.bool).view(1, 1)
+        state["geometric_prompt"].append_boxes(box_t, lbl_t)
+        return state
+
+    @torch.inference_mode()
     def _encode_current_prompts(self, state: Dict, encode_text: bool = True, skip_coords: bool = False):
         """Encodes whatever prompts (boxes/points) are currently in geometric_prompt.
         
