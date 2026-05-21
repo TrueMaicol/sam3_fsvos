@@ -48,15 +48,45 @@ pip install -e .
 
 This installs `sam3` as an editable package so any changes to the source code are immediately reflected without reinstalling.
 
-## Step 5 — Install the remaining dependencies
+## Step 5 — Install packages that require a source build
+
+Some packages must be built from source because the PyPI wheels are incomplete or missing APIs.
+
+### pycocotools (ppwwyyxx fork)
+
+The standard `pycocotools` PyPI package is missing some APIs. Clone and build from the ppwwyyxx fork instead:
+
+```bash
+git clone https://github.com/ppwwyyxx/cocoapi.git
+cd cocoapi/PythonAPI
+python setup.py build_ext install
+cd ../..
+```
+
+### decord
+
+The PyPI wheel for `decord` targets Python 3.6 and may not work correctly on Python 3.12. If you encounter issues, build from source:
+
+```bash
+git clone --recursive https://github.com/dmlc/decord
+cd decord && mkdir build && cd build
+cmake .. -DUSE_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+make -j$(nproc)
+cd ../python && pip install -e .
+cd ../..
+```
+
+If the PyPI wheel happens to work on your system (`pip install decord==0.6.0`), you can skip the source build.
+
+## Step 6 — Install the remaining dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-`requirements.txt` contains the full frozen environment (pinned versions) used for experiments, excluding PyTorch, SAM3, and the bundled NVIDIA libraries.
+`requirements.txt` contains the full frozen environment (pinned versions) used for experiments, excluding PyTorch, SAM3, the bundled NVIDIA libraries, and the source-built packages above.
 
-## Step 6 — Verify the installation
+## Step 7 — Verify the installation
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
