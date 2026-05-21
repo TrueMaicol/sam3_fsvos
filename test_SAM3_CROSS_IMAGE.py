@@ -25,6 +25,8 @@ from sklearn.metrics import pairwise_distances
 import matplotlib.pyplot as plt
 import re
 
+from sam3.model.encoder import pool_text_feat
+
 def agg_function_arg(value):
     fixed_values = {"sum", "mean", "max", "min"}
     if value in fixed_values:
@@ -121,8 +123,13 @@ def get_arguments():
         parser.add_argument("--attention_aggregate_function", type=agg_function_arg, default="sum", help="Aggregation function to be used to aggregate attention matrices on the key dimension")
         parser.add_argument("--attn_sampling_mode", type=str, default="top-k", choices=["top-k", "bottom-k"], help="Point sampling method for attention priors")
         
-        # Exp 6: Dense cross-attention sub-options
-        parser.add_argument("--inject_text_pooling", action="store_true", default=False, help="If set, add the pooled-text bias to every image patch (query and support) before the Fusion Encoder self-attention layers, mirroring the text conditioning applied during SAM3 training.")
+        # Injection of Text Pooling Bias options
+        # parser.add_argument("--inject_text_pooling", action="store_true", default=False, help="If set, add the pooled-text bias to every image patch (query and support) before the Fusion Encoder self-attention layers, mirroring the text conditioning applied during SAM3 training.")
+        parser.add_argument("--inject_text_pooling", action="store_true", default=False, help="Inject text pooling bias into the fusion encoder")
+        parser.add_argument("--injection_text_pooling_stage", type=str, default="point_sampling", choices=["point_sampling", "inference_pass", "both"], help="If --inject_text_pooling is set, this option determines when to inject the text pooling bias into the fusion encoder; either into the point sampling stage, the inference stage, or both.")
+        parser.add_argument("--injection_text_pooling_in_prompts_sampling", action="store_true", default=False, help="If --inject_text_pooling is set and stage covers point_sampling, also bias support-side tokens during the sampling pass (visual prompt tokens for Exp 5/7, dense support spatial K/V for Exp 6, support prompt tokens for Exp 1). Default False = image patches only.")
+        parser.add_argument("--injection_text_pooling_in_prompts_inference", action="store_true", default=False, help="If --inject_text_pooling is set and stage covers inference_pass, also bias the aggregated visual prompt fed to the inference forward. Default False = image patches only.")
+        
         #
         parser.add_argument("--num_points_from_mask", type=int, default=20)
         parser.add_argument("--use_query_as_support", action="store_true", default=False, help="Use the query image as support image (only for 1-shot)")
@@ -136,8 +143,16 @@ def get_arguments():
             help=(
                 "Type of visual prompt built from support images. "
                 "'points': random points from support mask (default). "
-                "'box': bounding box of largest connected blob. "
+                "'box': bounding box of a connected blob (see --blob_selection). "
                 "Applies to --experiment_mode=attn_prior, self_attn (sampling pass), and random (direct support encoding)."
+            ))
+        parser.add_argument("--blob_selection", type=str, default="largest",
+            choices=["largest", "smallest"],
+            help=(
+                "Which connected blob to use when --support_prompt_type=box. "
+                "'largest' (default): bounding box of the biggest foreground blob. "
+                "'smallest': bounding box of the smallest blob with area >= 10 px "
+                "(noise artifacts smaller than 10 px are ignored)."
             ))
 
         # Loggin arguments
@@ -406,19 +421,34 @@ def get_random_points_from_mask(mask, num_points):
     pts_norm = np.stack([x_coords[indices] / mask_arr.shape[1], y_coords[indices] / mask_arr.shape[0]], axis=1)
     return pts_norm[:, None, :], pts_actual
 
-def get_bbox_from_largest_blob(mask):
+def get_bbox_from_blob(mask, blob_selection="largest"):
     """
-    Returns the bounding box of the largest connected foreground blob as
+    Returns the bounding box of a connected foreground blob as
     normalized [cx, cy, w, h] in [0, 1] (SAM3 add_geometric_prompt format).
-    Returns None if the mask is empty.
+
+    Args:
+        mask: 2-D binary mask (tensor or numpy array).
+        blob_selection: "largest" (default) selects the biggest blob;
+                        "smallest" selects the smallest blob with area >= 10 px
+                        to skip single-pixel noise artifacts.
+    Returns None if the mask is empty or no qualifying blob is found.
     """
     mask_arr = mask.cpu().numpy() if hasattr(mask, 'cpu') else np.array(mask)
     mask_arr = (mask_arr.squeeze() > 0).astype(np.uint8)
     n_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask_arr, connectivity=8)
     if n_labels <= 1:
         return None
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    best = int(np.argmax(areas)) + 1  # +1 to skip background label 0
+    areas = stats[1:, cv2.CC_STAT_AREA]  # exclude background label 0
+    if blob_selection == "smallest":
+        MIN_AREA = 10  # ignore noise blobs
+        valid = np.where(areas >= MIN_AREA)[0]
+        if len(valid) == 0:
+            # Fallback to the absolute smallest blob if none are >= 10px
+            best = int(np.argmin(areas)) + 1
+        else:
+            best = int(valid[np.argmin(areas[valid])]) + 1
+    else:  # "largest"
+        best = int(np.argmax(areas)) + 1
     x1 = stats[best, cv2.CC_STAT_LEFT]
     y1 = stats[best, cv2.CC_STAT_TOP]
     bw = stats[best, cv2.CC_STAT_WIDTH]
@@ -429,6 +459,10 @@ def get_bbox_from_largest_blob(mask):
     nw = bw / W
     nh = bh / H
     return [cx, cy, nw, nh]
+
+# Backwards-compatible alias
+def get_bbox_from_largest_blob(mask):
+    return get_bbox_from_blob(mask, blob_selection="largest")
 
 def plot_embeddings_tsne(all_features, matched_indices, sampled_indices, output_path):
     """
@@ -597,18 +631,21 @@ def encode_support_visual_tokens(processor, support_imgs, support_masks, num_poi
     return torch.cat(visual_tokens, dim=0), torch.cat(visual_masks, dim=1)
 
 
-def encode_support_box_tokens(processor, support_imgs, support_masks, skip_coords, tag="SupportBox"):
-    """Encode the largest-blob bounding box from each support mask as visual tokens.
+def encode_support_box_tokens(processor, support_imgs, support_masks, skip_coords,
+                              tag="SupportBox", blob_selection="largest"):
+    """Encode a blob's bounding box from each support mask as visual tokens.
+    Args:
+        blob_selection: "largest" (default) or "smallest" — which connected blob to use.
     Returns (agg_prompt, agg_mask, boxes_list) where boxes_list is [[cx,cy,w,h], ...] per shot."""
     assert support_imgs.shape[0] == support_masks.shape[0]
     visual_tokens = []
     visual_masks = []
     boxes_list = []
     for idx in range(support_imgs.shape[0]):
-        box_cxcywh = get_bbox_from_largest_blob(support_masks[idx])
+        box_cxcywh = get_bbox_from_blob(support_masks[idx], blob_selection=blob_selection)
         if box_cxcywh is None:
             raise Exception(f"Mask for support image {idx} is empty — no bounding box available.")
-        print(f"[{tag}] support {idx+1}/{support_imgs.shape[0]} - encoding box {[f'{v:.3f}' for v in box_cxcywh]}")
+        print(f"[{tag}] support {idx+1}/{support_imgs.shape[0]} ({blob_selection} blob) - encoding box {[f'{v:.3f}' for v in box_cxcywh]}")
         state = encode_box_prompts(processor, support_imgs[idx], box_cxcywh, skip_coords)
         visual_tokens.append(state["prompt"])
         visual_masks.append(state["prompt_mask"])
@@ -679,7 +716,7 @@ def get_query_self_matching_points(processor=None, support_imgs=None, support_ma
 
 def get_attn_prior_points(query_img, text_prompt, num_points, matcher_calculator, attn_layers,
                            visual_prompt=None, visual_prompt_mask=None, attention_aggregate_function="sum",
-                           attn_sampling_mode="top-k", inject_text_pooling=False):
+                           attn_sampling_mode="top-k", inject_into_image_patches=False):
     """
     Sample num_points prompt points from the fusion encoder visual/points cross-attention map.
     Returns norm_pts [num_points, 2] in normalized (x, y) coords.
@@ -692,7 +729,7 @@ def get_attn_prior_points(query_img, text_prompt, num_points, matcher_calculator
         visual_prompt_mask=visual_prompt_mask,
         attn_layers=attn_layers,
         agg_function=attention_aggregate_function,
-        inject_text_pooling=inject_text_pooling,
+        inject_into_image_patches=inject_into_image_patches,
     )
     # Point selection uses attention to visual/point tokens (not text)
     pts_map = matcher_calculator.last_cross_attn_points_map  # [72, 72] numpy
@@ -721,7 +758,7 @@ def get_self_attn_points(query_img, text_prompt, num_points, matcher_calculator,
                                   attn_layers, visual_prompt=None, visual_prompt_mask=None,
                                   include_text_in_prompt=True, attention_aggregate_function="sum",
                                   attn_sampling_mode="bottom-k", skip_coords=False,
-                                  inject_text_pooling=False):
+                                  inject_into_image_patches=False):
     """
     Exp 7: select num_points prompt points from the fusion encoder self-attention map,
     choosing the bottom-k patches (lowest row-sum = empirically the object region).
@@ -736,7 +773,7 @@ def get_self_attn_points(query_img, text_prompt, num_points, matcher_calculator,
         include_text_in_prompt=include_text_in_prompt,
         agg_function=attention_aggregate_function,
         skip_coords=skip_coords,
-        inject_text_pooling=inject_text_pooling,
+        inject_into_image_patches=inject_into_image_patches,
     )
     self_map = matcher_calculator.last_self_attn_map  # [72, 72] numpy float32
     W = matcher_calculator.encoder_feat_size           # 72
@@ -757,9 +794,13 @@ def get_dense_cross_attn_points(processor=None, support_imgs=None, support_masks
                                  query_img=None, num_points=20, matcher_calculator=None,
                                  text_prompt="visual", skip_coords=False,
                                  attn_layers="all",
-                                 inject_text_pooling=False,
+                                 inject_into_image_patches=False,
+                                 inject_into_support_feats=False,
+                                 pooled_text=None,
                                  attention_aggregate_function="sum",
-                                 attn_sampling_mode="top-k"):
+                                 attn_sampling_mode="top-k",
+                                 visual_prompt=None, visual_prompt_mask=None,
+                                 ):
     """
     Exp 6: Extract prompt points using dense cross-attention between query patches and
     foreground support patches (pre-softmax logits aggregated into a localization heatmap).
@@ -778,9 +819,11 @@ def get_dense_cross_attn_points(processor=None, support_imgs=None, support_masks
 
     # Build support visual prompt to condition the cross-attention layers (Exp 6 still
     # uses cross-attn to text+visual; only self-attn is replaced with dense support attn)
-    agg_support_prompt, agg_support_mask = encode_support_visual_tokens(
-        processor, support_imgs, support_masks, num_points, skip_coords, tag="DenseCA"
-    )
+    if visual_prompt is None or visual_prompt_mask is None:
+        # visual_prompt, visual_prompt_mask = encode_support_visual_tokens(
+        #     processor, support_imgs, support_masks, num_points, skip_coords, tag="DenseCA"
+        # )
+        raise ValueError("Visual prompt and mask are required for dense cross-attention")
 
     # Run the dense cross-attention pass and extract the heatmap
     heatmap_2d = matcher_calculator.get_dense_cross_attn_map(
@@ -790,9 +833,11 @@ def get_dense_cross_attn_points(processor=None, support_imgs=None, support_masks
         text_prompt=text_prompt,
         skip_coords=skip_coords,
         attn_layers=attn_layers,
-        visual_prompt=agg_support_prompt,
-        visual_prompt_mask=agg_support_mask,
-        inject_text_pooling=inject_text_pooling,
+        visual_prompt=visual_prompt,
+        visual_prompt_mask=visual_prompt_mask,
+        inject_into_image_patches=inject_into_image_patches,
+        inject_into_support_feats=inject_into_support_feats,
+        pooled_text=pooled_text,
         agg_function=attention_aggregate_function,
     )
 
@@ -811,7 +856,31 @@ def get_dense_cross_attn_points(processor=None, support_imgs=None, support_masks
     return norm_pts.numpy()
 
 
-def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_masks=None, query_img=None, skip_coords=False, num_points=20, matcher_calculator=None, text_prompt="visual", use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, experiment_mode="random", attn_layers="last", inject_text_pooling=False, sampling_inputs="both", attention_aggregate_function="sum", attn_sampling_mode="top-k", support_prompt_type="points"):
+def _compute_pooled_text(processor, text_prompt):
+    """Compute the projected pooled-text bias once per episode. Returns [1, 256]."""
+    text_outputs = processor.model.backbone.forward_text([text_prompt], device=processor.device)
+    text_feats = text_outputs["language_features"]
+    text_mask  = text_outputs["language_mask"]
+    encoder = processor.model.transformer.encoder
+    pooled_text = pool_text_feat(text_feats, text_mask, encoder.pool_text_with_mask)
+    pooled_text = encoder.text_pooling_proj(pooled_text)
+    print(f"[PooledText] computed pooled-text bias for prompt='{text_prompt}'")
+    return pooled_text
+
+
+def _resolve_injection(inject_text_pooling, stage, in_prompts_sampling, in_prompts_inference):
+    """Resolve the four injection booleans from the master flag + stage + per-stage in_prompts flags."""
+    inj_sampling  = bool(inject_text_pooling) and stage in ("point_sampling", "both")
+    inj_inference = bool(inject_text_pooling) and stage in ("inference_pass", "both")
+    return (
+        inj_sampling,
+        inj_inference,
+        inj_sampling  and bool(in_prompts_sampling),
+        inj_inference and bool(in_prompts_inference),
+    )
+
+
+def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_masks=None, query_img=None, skip_coords=False, num_points=20, matcher_calculator=None, text_prompt="visual", use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, experiment_mode="random", attn_layers="last", inject_text_pooling=False, injection_text_pooling_stage="point_sampling", injection_text_pooling_in_prompts_sampling=False, injection_text_pooling_in_prompts_inference=False, sampling_inputs="both", attention_aggregate_function="sum", attn_sampling_mode="top-k", support_prompt_type="points", blob_selection="largest"):
     if processor is None:
         raise Exception("Processor is not specified")
     if support_imgs is None:
@@ -852,13 +921,26 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
         if sampling_inputs in ("both", "support_only"):
             if support_prompt_type == "box":
                 _sampling_vp, _sampling_vm, support_boxes = encode_support_box_tokens(
-                    processor, support_imgs, support_masks, skip_coords, tag="Sampling"
+                    processor, support_imgs, support_masks, skip_coords,
+                    tag="Sampling", blob_selection=blob_selection
                 )
             else:
                 _sampling_vp, _sampling_vm = encode_support_visual_tokens(
                     processor, support_imgs, support_masks, num_points, skip_coords, tag="Sampling"
                 )
         _include_text = (sampling_inputs != "support_only")
+
+    # Resolve injection booleans + compute pooled_text once per call (shared across all stages and branches).
+    inj_sampling, inj_inference, inj_prompts_sampling, inj_prompts_inference = _resolve_injection(
+        inject_text_pooling, injection_text_pooling_stage,
+        injection_text_pooling_in_prompts_sampling, injection_text_pooling_in_prompts_inference,
+    )
+    pooled_text = _compute_pooled_text(processor, text_prompt) if inject_text_pooling else None
+
+    # Sampling-stage support-side bias for Exp 5/7 visual prompt tokens.
+    # _sampling_vp shape: [L, 1, 256]; pooled_text [1, 256] → unsqueeze(0) [1, 1, 256] broadcasts onto every token.
+    if inj_prompts_sampling and _sampling_vp is not None:
+        _sampling_vp = _sampling_vp + pooled_text.unsqueeze(0)
 
     # All point/box data returned is in normalized [0,1] coordinates
     norm_pts_sampled = None
@@ -872,13 +954,16 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
             processor=processor,
             support_imgs=support_imgs,
             support_masks=support_masks,
+            visual_prompt=_sampling_vp, visual_prompt_mask=_sampling_vm,
             query_img=query_img,
             num_points=num_points,
             matcher_calculator=matcher_calculator,
             text_prompt=text_prompt,
             skip_coords=skip_coords,
             attn_layers=attn_layers,
-            inject_text_pooling=inject_text_pooling,
+            inject_into_image_patches=inj_sampling,
+            inject_into_support_feats=inj_prompts_sampling,
+            pooled_text=pooled_text,
             attention_aggregate_function=attention_aggregate_function,
             attn_sampling_mode=attn_sampling_mode,
         )
@@ -903,7 +988,7 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
             attention_aggregate_function=attention_aggregate_function,
             attn_sampling_mode=attn_sampling_mode,
             skip_coords=skip_coords,
-            inject_text_pooling=inject_text_pooling,
+            inject_into_image_patches=inj_sampling,
         )
         if pts_norm is not None:
             # previous experiments showed that skip_coords=False is a lot worse for points on the query image
@@ -922,7 +1007,7 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
             visual_prompt=_sampling_vp, visual_prompt_mask=_sampling_vm,
             attention_aggregate_function=attention_aggregate_function,
             attn_sampling_mode=attn_sampling_mode,
-            inject_text_pooling=inject_text_pooling,
+            inject_into_image_patches=inj_sampling,
         )
         if pts_norm is not None:
             # previous experiments showed that skip_coords=False is a lot worse for points on the query image
@@ -975,17 +1060,20 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
             norm_box = box_norm
     else:  # "random"
         _random_boxes = []
+
         for idx in range(support_imgs.shape[0]):
             support_img = support_imgs[idx]
             support_mask = support_masks[idx]
 
             if support_prompt_type == "box":
-                box_cxcywh = get_bbox_from_largest_blob(support_mask)
+                box_cxcywh = get_bbox_from_blob(support_mask, blob_selection=blob_selection)
                 if box_cxcywh is None:
                     raise Exception(f"Mask for support image {idx} is empty — no bounding box available.")
                 print(f"[PromptTokens] support {idx+1}/{support_imgs.shape[0]} - encoding box {[f'{v:.3f}' for v in box_cxcywh]}")
                 state = encode_box_prompts(processor, support_img, box_cxcywh, skip_coords)
                 _random_boxes.append(box_cxcywh)
+                prompt = state["prompt"]
+                mask = state["prompt_mask"]
             else:
                 pts_norm, pts_actual = get_random_points_from_mask(mask=support_mask, num_points=num_points)
                 if pts_norm is None:
@@ -994,8 +1082,11 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
                 state = encode_pts_prompts(processor, support_img, pts_norm, skip_coords)
                 norm_pts_sampled = pts_norm
                 actual_pts_sampled = pts_actual
-            all_visual_tokens.append(state["prompt"])
-            all_visual_masks.append(state["prompt_mask"])
+                prompt = state["prompt"]
+                mask = state["prompt_mask"]
+
+            all_visual_tokens.append(prompt)
+            all_visual_masks.append(mask)
         if support_prompt_type == "box":
             support_boxes = _random_boxes
             
@@ -1008,7 +1099,13 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
     aggregated_visual_prompt = torch.cat(all_visual_tokens, dim=0)
     aggregated_visual_mask = torch.cat(all_visual_masks, dim=1)
 
-    return aggregated_visual_prompt, aggregated_visual_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled, support_boxes
+    # Inference-stage support-side bias: aggregated_visual_prompt has shape [total_seq, 1, 256];
+    # pooled_text [1, 256] → unsqueeze(0) [1, 1, 256] broadcasts onto every visual token.
+    # Equivalent to per-shot biasing before cat (sum is associative).
+    if inj_prompts_inference:
+        aggregated_visual_prompt = aggregated_visual_prompt + pooled_text.unsqueeze(0)
+
+    return aggregated_visual_prompt, aggregated_visual_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled, support_boxes, inj_inference
 
 def aggregate_prompt_with_text_tokens(processor=None, state=None, text_prompt="visual", aggregated_visual_prompt=None, aggregated_visual_mask=None):
     if processor is None:
@@ -1048,7 +1145,7 @@ def update_state_with_support_prompt(state=None, prompt=None, prompt_mask=None, 
     
     return state
 
-def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, support_masks=None, text_prompt="visual", skip_coords=False, num_points=20, matcher_calculator=None, use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, experiment_mode="random", attn_layers="last", inject_text_pooling=False, sampling_inputs="both", attention_aggregate_function="sum", attn_sampling_mode="top-k", support_prompt_type="points"):
+def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, support_masks=None, text_prompt="visual", skip_coords=False, num_points=20, matcher_calculator=None, use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, experiment_mode="random", attn_layers="last", inject_text_pooling=False, injection_text_pooling_stage="point_sampling", injection_text_pooling_in_prompts_sampling=False, injection_text_pooling_in_prompts_inference=False, sampling_inputs="both", attention_aggregate_function="sum", attn_sampling_mode="top-k", support_prompt_type="points", blob_selection="largest"):
     if sam3 is None:
         raise Exception("SAM3 is not specified")
     elif query_frame is None:
@@ -1062,7 +1159,7 @@ def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, suppo
     ):
         raise Exception(f"matcher_calculator is required for experiment_mode={experiment_mode}")
 
-    visual_prompt, visual_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled, support_boxes = get_prompt_tokens_from_support(
+    visual_prompt, visual_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled, support_boxes, inj_inference = get_prompt_tokens_from_support(
         processor=sam3.processor,
         support_imgs=support_imgs,
         support_masks=support_masks,
@@ -1077,11 +1174,15 @@ def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, suppo
         visual_output_path=visual_output_path,
         experiment_mode=experiment_mode,
         attn_layers=attn_layers,
-        inject_text_pooling=inject_text_pooling,
         sampling_inputs=sampling_inputs,
         attention_aggregate_function=attention_aggregate_function,
         attn_sampling_mode=attn_sampling_mode,
         support_prompt_type=support_prompt_type,
+        blob_selection=blob_selection,
+        inject_text_pooling=inject_text_pooling,
+        injection_text_pooling_stage=injection_text_pooling_stage,
+        injection_text_pooling_in_prompts_sampling=injection_text_pooling_in_prompts_sampling,
+        injection_text_pooling_in_prompts_inference=injection_text_pooling_in_prompts_inference,
     )
     final_prompt, final_mask, text_outputs = aggregate_prompt_with_text_tokens(
         processor=sam3.processor,
@@ -1099,7 +1200,15 @@ def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, suppo
         prompt_mask=final_mask,
         text_outputs=text_outputs
     )
-    state = sam3.processor._forward_with_encoded_prompt(state)
+
+    encoder = sam3.processor.model.transformer.encoder
+    if inj_inference:
+        encoder.inject_text_pooling = True
+        print(f"[SAM3_CROSS_IMAGE] Inject text pooling on inference (experiment_mode={experiment_mode})")
+    try:
+        state = sam3.processor._forward_with_encoded_prompt(state)
+    finally:
+        encoder.inject_text_pooling = False
     print(f"Found {len(state['scores'])} objects")
     merged_mask = np.any(np.array(state['masks'].cpu()), axis=0).squeeze(0)
     return merged_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled, support_boxes
@@ -1283,10 +1392,14 @@ def main():
                         experiment_mode=args.experiment_mode,
                         attn_layers=args.attn_layers,
                         inject_text_pooling=args.inject_text_pooling,
+                        injection_text_pooling_stage=args.injection_text_pooling_stage,
+                        injection_text_pooling_in_prompts_sampling=args.injection_text_pooling_in_prompts_sampling,
+                        injection_text_pooling_in_prompts_inference=args.injection_text_pooling_in_prompts_inference,
                         sampling_inputs=args.sampling_inputs,
                         attention_aggregate_function=args.attention_aggregate_function,
                         attn_sampling_mode=args.attn_sampling_mode,
                         support_prompt_type=args.support_prompt_type,
+                        blob_selection=args.blob_selection,
                     )
 
                     # Save support bbox visualizations (one image per support shot)

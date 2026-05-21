@@ -90,7 +90,7 @@ class MatcherBoxCalculator():
                                   attn_layers: str | None = None,
                                   include_text_in_prompt: bool = True,
                                   agg_function: str = "sum",
-                                  inject_text_pooling: bool = False,
+                                  inject_into_image_patches: bool = False,
                                   ):
         if self.processor is None:
             raise ValueError("sam3_processor must be provided to use fused features")
@@ -141,7 +141,7 @@ class MatcherBoxCalculator():
                     layer.capture_self_attn_weights  = True
 
             encoder = self.processor.model.transformer.encoder
-            if inject_text_pooling:
+            if inject_into_image_patches:
                 encoder.inject_text_pooling = True
             try:
                 backbone_out, encoder_out, _ = self.processor.model._run_encoder(
@@ -170,12 +170,16 @@ class MatcherBoxCalculator():
         print(f"[FusedFeatures] output shape: {out_feats.shape}")
         return out_feats
 
+
+
     def get_dense_cross_attn_map(self, query_img, support_imgs, support_masks,
                                   text_prompt="visual", skip_coords=False,
                                   attn_layers="last",
                                   visual_prompt=None, visual_prompt_mask=None,
-                                  inject_text_pooling=False,
-                                  agg_function: str = "sum"
+                                  inject_into_image_patches=False,
+                                  inject_into_support_feats=False,
+                                  pooled_text=None,
+                                  agg_function: str = "sum",
                                   ):
         """
         Exp 6: Run a dense cross-attention pass where the Fusion Encoder's self-attention
@@ -195,7 +199,6 @@ class MatcherBoxCalculator():
             inject_text_pooling: if True, add the pooled-text bias to every image
                 patch (query and support) before the Fusion Encoder self-attention
                 layers, mirroring the conditioning applied during SAM3 training.
-
         Returns:
             heatmap_2d: np.ndarray [72, 72] of aggregated pre-softmax logits
         """
@@ -204,7 +207,7 @@ class MatcherBoxCalculator():
 
         # --- Step 1: Extract raw backbone features and apply text conditioning ---
         encoder = self.processor.model.transformer.encoder
-        # Always compute text_outputs: needed for num_text_tokens and optional pooled-text injection
+        # num_text_tokens is needed for cross-attn split; pooled_text is only needed if support-side injection requested
         text_outputs = self.processor.model.backbone.forward_text([text_prompt], device=self.device)
         num_text_tokens = text_outputs["language_features"].shape[0] if "language_features" in text_outputs else 0
 
@@ -218,18 +221,15 @@ class MatcherBoxCalculator():
             # [N, 256, 72, 72]
             sup_feats_spatial = backbone_out_sup["backbone_fpn"][2].float()
 
-            # --- Symmetry fix: inject pooled text into support features to mirror the query path ---
-            # The Fusion Encoder adds a class-specific pooled-text bias to every image patch
-            # before its self-attention layers. We apply the same here to support features so
-            # both Query (Q) and Support (K/V) have the same text-conditioning.
-            if inject_text_pooling:
-                text_feats = text_outputs["language_features"]  # [L, 1, 256]
-                text_mask  = text_outputs["language_mask"]       # [1, L]
-                pooled_text = pool_text_feat(
-                    text_feats, text_mask, encoder.pool_text_with_mask
-                )  # [1, 256]
-                pooled_text = encoder.text_pooling_proj(pooled_text)  # [1, 256]
-                # Broadcast to [N, 256, 72, 72] and add to support spatial features
+            # Symmetry fix: bias support spatial features with the pooled-text vector so that
+            # support K/V receive the same conditioning as the query patches in the Fusion Encoder.
+            if inject_into_support_feats:
+                if pooled_text is None:
+                    text_feats = text_outputs["language_features"]
+                    text_mask  = text_outputs["language_mask"]
+                    pooled_text = pool_text_feat(text_feats, text_mask, encoder.pool_text_with_mask)
+                    pooled_text = encoder.text_pooling_proj(pooled_text)
+                print("[MatcherBoxCalculator] Injecting text pooling into support features")
                 sup_feats_spatial = sup_feats_spatial + pooled_text.unsqueeze(-1).unsqueeze(-1)
 
 
@@ -276,8 +276,6 @@ class MatcherBoxCalculator():
             layer.capture_cross_attn_weights = True
 
         # --- Step 4: Run the encoder with dense support feats active ---
-        if inject_text_pooling:
-            encoder.inject_text_pooling = True
         try:
             self.get_fused_image_features(
                 query_img,
@@ -285,10 +283,10 @@ class MatcherBoxCalculator():
                 skip_coords=skip_coords,
                 visual_prompt=visual_prompt,
                 visual_prompt_mask=visual_prompt_mask,
+                inject_into_image_patches=inject_into_image_patches,
             )
         finally:
-            # Always reset layer state and encoder flags regardless of exceptions
-            encoder.inject_text_pooling = False
+            # Always reset layer state regardless of exceptions
             for layer in all_layers:
                 layer.dense_support_feats = None
                 layer.capture_self_attn_weights  = False

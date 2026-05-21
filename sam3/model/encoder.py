@@ -614,7 +614,7 @@ class TransformerEncoderFusion(TransformerEncoder):
         # but injection is gated solely by inject_text_pooling (default False).
         if self.inject_text_pooling:
             # Fusion: Add mean pooled text to image features
-            print("[FusionEncoder] Injecting text pooling into image features.")
+            print("[FusionEncoder] Injecting text pooling into image features")
             pooled_text = pool_text_feat(
                 prompt, prompt_key_padding_mask, self.pool_text_with_mask
             )

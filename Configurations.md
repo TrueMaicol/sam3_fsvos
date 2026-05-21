@@ -73,17 +73,20 @@ The key design levers are:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--support_prompt_type` | str | `points` | Type of visual prompt built from support images. `points`: random points sampled from the GT mask (default). `box`: bounding box of the largest connected foreground blob, encoded via the geometry encoder's ROI-align path. Applies to `--experiment_mode random` (direct support encoding) and `attn_prior` / `self_attn` (sampling pass). |
+| `--support_prompt_type` | str | `points` | Type of visual prompt built from support images. `points`: random points sampled from the GT mask (default). `box`: bounding box of a connected foreground blob (see `--blob_selection`), encoded via the geometry encoder's ROI-align path. Applies to `--experiment_mode random` (direct support encoding) and `attn_prior` / `self_attn` (sampling pass). |
+| `--blob_selection` | str | `largest` | Which connected foreground blob to use when `--support_prompt_type box`. `largest` (default): biggest blob by pixel area. `smallest`: smallest blob with area ≥ 10 px (blobs smaller than 10 px are treated as noise and ignored). |
 
 **`--support_prompt_type` choices:**
 
 | Value | Description |
 |-------|-------------|
 | `points` | Random points from support GT mask — scattered spatial tokens, each capturing a point's appearance and (unless `--skip_coords`) position |
-| `box` | Bounding box of the largest connected blob in the support mask. The geometry encoder encodes the box as a single token (or two corner tokens if `encode_boxes_as_points=True`) using ROI-align pooling to aggregate visual content within the box region. When `--skip_coords` is False, coordinate embeddings are also added; when True, only the ROI-pooled visual content is encoded |
+| `box` | Bounding box of a connected blob (largest or smallest, controlled by `--blob_selection`). The geometry encoder encodes the box as a single token (or two corner tokens if `encode_boxes_as_points=True`) using ROI-align pooling to aggregate visual content within the box region. When `--skip_coords` is False, coordinate embeddings are also added; when True, only the ROI-pooled visual content is encoded |
 
 **Notes:**
-- With `--support_prompt_type box`, connected-components is always run and the **largest blob** is selected — even if only one blob is present.
+- With `--support_prompt_type box`, connected-components is always run; `--blob_selection` then picks the target blob.
+- `--blob_selection smallest` ignores blobs smaller than 10 px to skip noise artifacts.
+- `--blob_selection` is only meaningful when `--support_prompt_type box`; it has no effect for `points`.
 - Incompatible with `--sampling_inputs text_only` (no visual tokens are built in that mode).
 - Not applicable to `--experiment_mode matcher`, `self_matching`, or `dense_cross_attn`.
 
@@ -131,11 +134,25 @@ The key design levers are:
 | `--attention_aggregate_function` | str | `sum` | Aggregation function used to aggregate attention matrices on the key dimension. Choices: `sum`, `mean`, `max`, `min`, `top-*-mean` (e.g. `top-5-mean`) |
 | `--attn_sampling_mode` | str | `top-k` | Point sampling method for attention priors. Choices: `top-k`, `bottom-k` |
 
-### Text Pooling Injection (Experiments 5, 6, 7)
+### Text Pooling Injection (all experiments)
+
+The pooled-text bias is the projected mean-pooled text embedding (`text_pooling_proj(pool_text_feat(...))`), shape `[1, 256]`. It mirrors the text conditioning applied during SAM3 training. Injection is controlled by one master switch plus three sub-flags:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--inject_text_pooling` | bool | False | If set, add the mean-pooled text embedding (after projection) as a bias to every image patch **before** the Fusion Encoder self-attention layers. Applies to **all** experiments that run a Fusion Encoder pass (Exp 5, 6, and 7). Mirrors the text conditioning applied during SAM3 training. Both query patches and support backbone features receive the same bias for symmetry. Defaults to False — standard behaviour (no injection). |
+| `--inject_text_pooling` | bool | False | Master on/off. When False, all sub-flags are no-ops. When True, the bias is added to query image patches at the stages selected by `--injection_text_pooling_stage`; support-side targets are only biased when the corresponding `in_prompts_*` flag is set. |
+| `--injection_text_pooling_stage` | str | `point_sampling` | Which forward pass(es) receive the bias. Choices: `point_sampling` (Fusion Encoder pass that extracts the attention map for Exp 5/6/7), `inference_pass` (final SAM3 inference forward), `both`. |
+| `--injection_text_pooling_in_prompts_sampling` | bool | False | During the point-sampling pass, also bias support-side tokens: visual prompt tokens for Exp 5/7, dense support spatial K/V for Exp 6. No effect on Exp 1/2/3/4 (no separate sampling pass). |
+| `--injection_text_pooling_in_prompts_inference` | bool | False | During the inference forward, also bias the aggregated visual prompt fed to the encoder. Applies to all experiments. For Exp 1, this replaces the previous per-shot bias loop and is mathematically equivalent. |
+
+**Effect matrix (when master flag is on):**
+
+| Target | Image patches (query) | Visual prompt tokens (Exp 5/7) | Dense support K/V (Exp 6) | Aggregated visual prompt (inference, all Exp) |
+|--------|-----------------------|--------------------------------|---------------------------|------------------------------------------------|
+| Sampling pass | `stage ∈ {point_sampling, both}` | `stage ∈ {point_sampling, both} AND in_prompts_sampling` | `stage ∈ {point_sampling, both} AND in_prompts_sampling` | — |
+| Inference pass | `stage ∈ {inference_pass, both}` | — | — | `stage ∈ {inference_pass, both} AND in_prompts_inference` |
+
+`pool_text_feat` is computed at most once per `cross_image_prediction` call regardless of how many stages or targets are biased.
 
 ### Sampling Pass Input Control (Experiments 5 and 7)
 
@@ -401,7 +418,10 @@ Does NOT use the bipartite matcher. Does NOT go through `--sampling` (the attent
 --attn_layers all | last
 --attention_aggregate_function sum | mean | max | min | top-*-mean
 --attn_sampling_mode top-k | bottom-k
-[--inject_text_pooling]
+[--inject_text_pooling
+ --injection_text_pooling_stage point_sampling|inference_pass|both
+ --injection_text_pooling_in_prompts_sampling
+ --injection_text_pooling_in_prompts_inference]
 ```
 
 **Motivation:** In the standard pipeline, the query image only sees the support object through a compressed visual prompt in the Fusion Encoder's cross-attention. Experiment 6 replaces the Fusion Encoder's self-attention with a dense cross-attention where the query image patches directly attend to the support object's foreground patches at patch resolution, enabling explicit patch-level correspondence.
@@ -537,11 +557,17 @@ Both use `return_pre_softmax=True, average_attn_weights=True` internally — raw
     --sampling_inputs             controls fusion encoder inputs in sampling pass
     --attention_aggregate_function controls aggregation of attention matrices
     --attn_sampling_mode          top-k (default) or bottom-k
-    --inject_text_pooling         optional — add pooled-text bias to image patches
+    --inject_text_pooling         master on/off (see Text Pooling Injection table)
+    --injection_text_pooling_stage             point_sampling | inference_pass | both
+    --injection_text_pooling_in_prompts_sampling   bias visual prompt tokens during sampling pass
+    --injection_text_pooling_in_prompts_inference  bias aggregated visual prompt during inference
 
 --experiment_mode dense_cross_attn
     requires: --nshot > 0
-    --inject_text_pooling         optional — add pooled-text bias to query and support patches
+    --inject_text_pooling         master on/off (see Text Pooling Injection table)
+    --injection_text_pooling_stage             point_sampling | inference_pass | both
+    --injection_text_pooling_in_prompts_sampling   bias dense support K/V during sampling pass
+    --injection_text_pooling_in_prompts_inference  bias aggregated visual prompt during inference
     --attn_layers                 last (default) or all
     --attention_aggregate_function controls aggregation of attention matrices
     --attn_sampling_mode          top-k (default) or bottom-k
@@ -553,18 +579,25 @@ Both use `return_pre_softmax=True, average_attn_weights=True` internally — raw
     --attention_aggregate_function controls aggregation of attention matrices
     --attn_sampling_mode          top-k or bottom-k (default)
     --support_prompt_type         points (default) or box; incompatible with sampling_inputs=text_only
-    --inject_text_pooling         optional — add pooled-text bias to image patches
+    --blob_selection              largest (default) or smallest; only meaningful with support_prompt_type=box
+    --inject_text_pooling         master on/off (see Text Pooling Injection table)
+    --injection_text_pooling_stage             point_sampling | inference_pass | both
+    --injection_text_pooling_in_prompts_sampling   bias visual prompt tokens during sampling pass
+    --injection_text_pooling_in_prompts_inference  bias aggregated visual prompt during inference
 
 --experiment_mode attn_prior
     --support_prompt_type         points (default) or box; incompatible with sampling_inputs=text_only
+    --blob_selection              largest (default) or smallest; only meaningful with support_prompt_type=box
 
 --experiment_mode random
     --support_prompt_type         points (default) or box
+    --blob_selection              largest (default) or smallest; only meaningful with support_prompt_type=box
 
 --sampling_inputs                 applies only to --experiment_mode attn_prior or self_attn
 --attn_layers                     affects point selection for Exp 5/6/7 and attention map saving for all experiments
 --attention_aggregate_function    applies to Exp 5/6/7 for attention map aggregation
 --attn_sampling_mode              applies to Exp 5/6/7 for point selection from attention maps
+--blob_selection                  applies whenever --support_prompt_type box is active
 ```
 
 ---
@@ -584,12 +617,20 @@ Both use `return_pre_softmax=True, average_attn_weights=True` internally — raw
 | 5c — attention prior, text only sampling | `--experiment_mode attn_prior --nshot N --sampling_inputs text_only --attn_layers last` |
 | 6a — dense cross-attn topk | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode top-k --attn_layers all` |
 | 6b — dense cross-attn bottomk | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode bottom-k --attn_layers all` |
-| 6a+text — dense cross-attn topk + text pooling | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode top-k --attn_layers all --inject_text_pooling` |
-| 6b+text — dense cross-attn bottomk + text pooling | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode bottom-k --attn_layers all --inject_text_pooling` |
+| 6a+text — dense cross-attn topk + text pooling (image patches only, sampling) | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode top-k --attn_layers all --inject_text_pooling --injection_text_pooling_stage point_sampling` |
+| 6a+text-prompts-sampling — dense cross-attn topk + text pooling on image+support K/V | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode top-k --attn_layers all --inject_text_pooling --injection_text_pooling_stage point_sampling --injection_text_pooling_in_prompts_sampling` |
+| 6b+text — dense cross-attn bottomk + text pooling | `--experiment_mode dense_cross_attn --nshot N --attn_sampling_mode bottom-k --attn_layers all --inject_text_pooling --injection_text_pooling_stage point_sampling` |
+| 1+text-inf — random + text pooling on inference (image patches only) | `--experiment_mode random --nshot N --inject_text_pooling --injection_text_pooling_stage inference_pass` |
+| 1+text-inf-prompts — random + text pooling on inference (image + aggregated prompt) | `--experiment_mode random --nshot N --inject_text_pooling --injection_text_pooling_stage inference_pass --injection_text_pooling_in_prompts_inference` |
+| 7+text-both-mixed — self-attn + text pooling sampling-prompts only, inference image-only | `--experiment_mode self_attn --nshot N --attn_sampling_mode bottom-k --inject_text_pooling --injection_text_pooling_stage both --injection_text_pooling_in_prompts_sampling` |
 | 7a — self-attn bottom-k (both) | `--experiment_mode self_attn --nshot N --attn_sampling_mode bottom-k --attn_layers last` |
 | 7b — self-attn bottom-k, text only | `--experiment_mode self_attn --nshot N --sampling_inputs text_only --attn_layers last` |
 | 7c — self-attn bottom-k, support only | `--experiment_mode self_attn --nshot N --sampling_inputs support_only --attn_layers last` |
 | 1-box — random + box support | `--experiment_mode random --nshot N --support_prompt_type box` |
+| 1-box-small — random + smallest blob | `--experiment_mode random --nshot N --support_prompt_type box --blob_selection smallest` |
 | 5-box — attn prior + box support | `--experiment_mode attn_prior --nshot N --attn_sampling_mode top-k --attn_layers last --support_prompt_type box` |
+| 5-box-small — attn prior + smallest blob | `--experiment_mode attn_prior --nshot N --attn_sampling_mode top-k --attn_layers last --support_prompt_type box --blob_selection smallest` |
 | 7-box — self-attn + box support (both) | `--experiment_mode self_attn --nshot N --attn_sampling_mode bottom-k --attn_layers last --sampling_inputs both --support_prompt_type box` |
+| 7-box-small — self-attn + smallest blob (both) | `--experiment_mode self_attn --nshot N --attn_sampling_mode bottom-k --attn_layers last --sampling_inputs both --support_prompt_type box --blob_selection smallest` |
 | 7-box-all — self-attn + box support (all layers) | `--experiment_mode self_attn --nshot N --attn_sampling_mode bottom-k --attn_layers all --sampling_inputs both --support_prompt_type box` |
+| 7-box-all-small — self-attn + smallest blob (all layers) | `--experiment_mode self_attn --nshot N --attn_sampling_mode bottom-k --attn_layers all --sampling_inputs both --support_prompt_type box --blob_selection smallest` |
