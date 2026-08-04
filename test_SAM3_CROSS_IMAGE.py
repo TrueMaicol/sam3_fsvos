@@ -1109,10 +1109,9 @@ def get_dense_cross_attn_points(processor=None, support_imgs=None, support_masks
     # Build support visual prompt to condition the cross-attention layers (Exp 6 still
     # uses cross-attn to text+visual; only self-attn is replaced with dense support attn)
     if visual_prompt is None or visual_prompt_mask is None:
-        # visual_prompt, visual_prompt_mask = encode_support_visual_tokens(
-        #     processor, support_imgs, support_masks, num_points, skip_coords, tag="DenseCA"
-        # )
-        raise ValueError("Visual prompt and mask are required for dense cross-attention")
+        visual_prompt, visual_prompt_mask = encode_support_visual_tokens(
+            processor, support_imgs, support_masks, num_points, skip_coords, tag="DenseCA"
+        )
 
     # Run the dense cross-attention pass and extract the heatmap
     heatmap_2d = matcher_calculator.get_dense_cross_attn_map(
