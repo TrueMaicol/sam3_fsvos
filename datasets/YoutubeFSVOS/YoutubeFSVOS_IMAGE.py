@@ -60,6 +60,7 @@ class YTVOSDataset_Image(Dataset):
             self.class_ids = [self.class_ids[finetune_idx]]
 
         self.class_idx_to_all_lemmas = {}
+        self.idx_to_ground_truth_label = {cat['id']: cat['name'] for cat in categories if cat['id'] in self.class_ids}
         if self.use_synset_names:
             synset_mapping = pd.read_csv(self.synset_mapping_csv_path, sep="|")
             self.idx_to_classname = {}

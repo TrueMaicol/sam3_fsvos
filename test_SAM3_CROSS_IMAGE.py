@@ -24,6 +24,7 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import pairwise_distances
 import matplotlib.pyplot as plt
 import re
+from scipy import ndimage as scipy_ndimage
 
 from sam3.model.encoder import pool_text_feat
 
@@ -65,14 +66,27 @@ def validate_args(args):
         if args.use_query_as_support:
             raise Exception(f"--experiment_mode={em} is incompatible with --use_query_as_support")
 
-    if em == "self_attn":
-        if args.sampling_inputs == "support_only" and not args.nshot > 0:
+    if args.sampling_inputs == "support_only" and em in ("self_attn", "attn_prior"):
+        if not args.nshot > 0:
             raise Exception(
-                "--experiment_mode=self_attn with --sampling_inputs=support_only requires --nshot > 0"
+                f"--experiment_mode={em} with --sampling_inputs=support_only requires --nshot > 0"
             )
 
-    if args.sampling_inputs != "both" and em not in ("attn_prior", "self_attn"):
-        raise Exception("--sampling_inputs only applies to --experiment_mode=attn_prior or self_attn")
+    if args.sampling_inputs != "both":
+        # text_only and support_only are fully meaningful for attn_prior and self_attn.
+        # support_only is also valid for matcher: it replaces the class label with the "visual"
+        # sentinel in the fusion encoder's feature extraction pass (Exp 3b).
+        # text_only for matcher has no additional effect and is therefore disallowed.
+        allowed = em in ("attn_prior", "self_attn") or (
+            em == "matcher" and args.sampling_inputs == "support_only"
+        )
+        if not allowed:
+            raise Exception(
+                "--sampling_inputs text_only/support_only only applies to "
+                "--experiment_mode=attn_prior or self_attn; "
+                "--sampling_inputs support_only also applies to --experiment_mode=matcher "
+                "(replaces class label with 'visual' sentinel in the fusion feature extraction pass)"
+            )
 
     if args.support_prompt_type == "box":
         if args.sampling_inputs == "text_only":
@@ -93,7 +107,7 @@ def get_arguments():
         parser.add_argument("--frame_num", type=int, default=1)
         parser.add_argument("--nshot", type=int, default=1)
         parser.add_argument("--use_synset_names", action="store_true", default=False)
-        parser.add_argument("--synset_mapping_folder_path", type=str, default="/leonardo_work/IscrC_MARSv2/datasets/synset_mappings")
+        parser.add_argument("--synset_mapping_folder_path", type=str, default="/megaverse/storage/samele/FSS-SAM3/datasets/synset_mappings/leaf")
         parser.add_argument("--use_grouping_ade20k", action="store_true", default=False, help="Enable grouping of classes using JSON [ONLY ON ADE20K].")
         parser.add_argument("--all_lemmas", action="store_true", default=False, help="Iterate over all lemmas, instead of just the one selected inside the mapping")
         parser.add_argument("--experiment_mode", type=str, default="random",
@@ -114,14 +128,14 @@ def get_arguments():
                 "Applies to attn_prior and self_attn. "
                 "'both': text label + support visual prompts (default). "
                 "'text_only': text label only (no visual prompts). "
-                "'support_only': support visual prompts only (no text tokens in cross-attention)."
+                "'support_only': support visual prompts + 'visual' sentinel token (class label suppressed; SAM3 still receives 'visual' as its required text input, no custom class name is used in the sampling pass)."
             ))
         parser.add_argument("--run_n", type=int, default=0)
         parser.add_argument("--skip_coords", action="store_true", default=False, help="Skip coordinate-based embeddings when generating prompt tokens from support images")
         parser.add_argument("--use_fused_matcher_features", action="store_true", default=False, help="Use fused features from the fusion encoder instead of native PE backbone features for matcher (only relevant for experiment_mode=matcher).")
-        parser.add_argument("--attn_layers", type=str, default="last", choices=["last", "all"], help="Which fusion encoder layers to aggregate attention from for both point selection and saving")
+        parser.add_argument("--attn_layers", type=str, default="all", choices=["last", "all"], help="Which fusion encoder layers to aggregate attention from for both point selection and saving")
         parser.add_argument("--attention_aggregate_function", type=agg_function_arg, default="sum", help="Aggregation function to be used to aggregate attention matrices on the key dimension")
-        parser.add_argument("--attn_sampling_mode", type=str, default="top-k", choices=["top-k", "bottom-k"], help="Point sampling method for attention priors")
+        parser.add_argument("--attn_sampling_mode", type=str, default="bottom-k", choices=["top-k", "bottom-k"], help="Point sampling method for attention priors")
         
         # Injection of Text Pooling Bias options
         # parser.add_argument("--inject_text_pooling", action="store_true", default=False, help="If set, add the pooled-text bias to every image patch (query and support) before the Fusion Encoder self-attention layers, mirroring the text conditioning applied during SAM3 training.")
@@ -133,7 +147,7 @@ def get_arguments():
         #
         parser.add_argument("--num_points_from_mask", type=int, default=20)
         parser.add_argument("--use_query_as_support", action="store_true", default=False, help="Use the query image as support image (only for 1-shot)")
-        parser.add_argument("--disable_text", action="store_true", default=False, help="Disable text prompts")
+        parser.add_argument("--disable_text_inference", action="store_true", default=False, help="Disable text prompts")
         parser.add_argument("--sampling", type=str, default="random", choices=["random", "top-k", "patch-core", "k-means-embeddings", "k-means-points", "k-medoids-embeddings", "k-medoids-points"], help="Sampling strategy for Matcher points")
         parser.add_argument("--visualize_embeddings", action="store_true", default=False, help="Generate t-SNE plots of the embeddings")
         # Random state management
@@ -145,7 +159,7 @@ def get_arguments():
                 "'points': random points from support mask (default). "
                 "'box': bounding box of a connected blob (see --blob_selection). "
                 "Applies to --experiment_mode=attn_prior, self_attn (sampling pass), and random (direct support encoding)."
-            ))
+        ))
         parser.add_argument("--blob_selection", type=str, default="largest",
             choices=["largest", "smallest"],
             help=(
@@ -153,10 +167,29 @@ def get_arguments():
                 "'largest' (default): bounding box of the biggest foreground blob. "
                 "'smallest': bounding box of the smallest blob with area >= 10 px "
                 "(noise artifacts smaller than 10 px are ignored)."
-            ))
-
+        ))
+        parser.add_argument("--sample_points_from_image", action="store_true", 
+            default=False, 
+            help="When sampling random points from the support image, or the query image (exp1, exp2). Sample randomly from the entire image instead of the mask region."
+        )
+        parser.add_argument("--fix_sampled_points", action="store_true",
+            default=False, help=(
+                "In the ALL_LEMMAS experiments, for the same synset, use always the same sampled points"
+                "'query_as_support' use the points sampled randomly on the first lemma (the points don't depend on the lemma itself, is random)"
+                "'attention_experiments' use the points sampled from the 'selected lemma' that is provided by the dataloader as the first lemma"
+                "the script fixes the first set of points computed and reuse it for all the other lemmas"
+            )
+        )
         # Loggin arguments
-        parser.add_argument('--log_dir', type=str, default='/leonardo_work/IscrC_MARSv2/SAM3_FSVOS/JOB_OUTPUT/logs')
+        parser.add_argument('--log_dir', type=str, default='/megaverse/storage/samele/FSS-SAM3/experiment_results_logs')
+        # Sharding: split inference across N parallel jobs by class, not by raw index.
+        # Each shard receives a disjoint, contiguous slice of the sorted class list so
+        # that no class is evaluated by more than one job.
+        # Usage: --num_shards 3 --shard_id 0  (shard 0 of 3)
+        parser.add_argument('--num_shards', type=int, default=1,
+            help="Total number of parallel shards to divide the class list into (default: 1 = no sharding).")
+        parser.add_argument('--shard_id', type=int, default=0,
+            help="Zero-based index of this shard (0 <= shard_id < num_shards, default: 0).")
         return parser.parse_args()
 
 def save_image_with_box(image, box, output_path):
@@ -314,7 +347,7 @@ def save_image(image, path):
         image = Image.fromarray(image)
     image.save(path)
 
-def save_results(class_dic, evaluator, args, virtual_to_original=None, original_class_dic=None, box_coordinates=None, point_scores=None):
+def save_results(class_dic, evaluator, args, virtual_to_original=None, original_class_dic=None, box_coordinates=None, point_scores=None, grond_truth_class_dic=None):
     # Save results to file
     results_dir = os.path.join(args.log_dir, args.benchmark)
     if args.session_name is not None:
@@ -330,6 +363,16 @@ def save_results(class_dic, evaluator, args, virtual_to_original=None, original_
             orig_cid = virtual_to_original.get(cid, cid)
             return orig_cid, original_class_dic.get(orig_cid, '')
         return None, None
+    
+    def _ground_truth_orig(cid):
+        if grond_truth_class_dic is not None:
+            if virtual_to_original is not None:
+                orig_cid = virtual_to_original.get(cid, cid)
+            else:
+                orig_cid = cid
+            return orig_cid, grond_truth_class_dic.get(orig_cid, '')
+        return None, None
+
 
     size_data = []
     for label, scores in [('SMALL', evaluator.iou_small_score), ('MEDIUM', evaluator.iou_medium_score), ('LARGE', evaluator.iou_large_score)]:
@@ -339,12 +382,18 @@ def save_results(class_dic, evaluator, args, virtual_to_original=None, original_
             if orig_cid is not None:
                 row['original_class_idx'] = orig_cid
                 row['original_class_name'] = orig_cname
+            orig_g_cid, orig_g_cname = _ground_truth_orig(cid)
+            if orig_g_cid is not None:
+                row['original_ground_truth_class_idx'] = orig_g_cid
+                row['original_ground_truth_class_name'] = orig_g_cname
             size_data.append(row)
     size_df = pd.DataFrame(size_data)
     size_csv_path = os.path.join(results_dir, f"{args.benchmark}_size_scores.csv")
     size_df.to_csv(size_csv_path, index=False, sep=';')
-    
+    print(f"Size scores saved to {size_csv_path}")
+
     sample_data = []
+    blob_data = []
     for class_idx, class_name, sample_list in zip(class_list_idx, class_list_names, evaluator.sample_details):
         for sample in sample_list:
             row_pt_score = sample.get('point_score', -1.0)
@@ -362,14 +411,40 @@ def save_results(class_dic, evaluator, args, virtual_to_original=None, original_
                 'all_point_score': float(sample.get('all_point_score', -1.0)),
                 'num_total_points': int(sample.get('num_total_points', -1)),
             }
+            blob_rows = [{
+                'class_id': class_idx,
+                'class_name': class_name,
+                'sample_id': sample['sample_id'],
+                **blob,
+            } for blob in sample['blob_results']]
+            
             orig_cid, orig_cname = _orig(class_idx)
+            orig_g_cid, orig_g_cname = _ground_truth_orig(class_idx)
             if orig_cid is not None:
                 row['original_class_idx'] = orig_cid
                 row['original_class_name'] = orig_cname
+                for blob in blob_rows:
+                    blob['original_class_idx'] = orig_cid
+                    blob['original_class_name'] = orig_cname
+            if orig_g_cid is not None:
+                row['original_ground_truth_class_idx'] = orig_g_cid
+                row['original_ground_truth_class_name'] = orig_g_cname
+                for blob in blob_rows:
+                    blob['original_ground_truth_class_idx'] = orig_g_cid
+                    blob['original_ground_truth_class_name'] = orig_g_cname
+            
             sample_data.append(row)
+            blob_data.extend(blob_rows)
+            
     sample_df = pd.DataFrame(sample_data)
     sample_csv_path = os.path.join(results_dir, f"{args.benchmark}_sample_scores.csv")
     sample_df.to_csv(sample_csv_path, index=False, sep=';')
+    print(f"Sample scores saved to {sample_csv_path}")
+
+    blob_df = pd.DataFrame(blob_data)
+    blob_csv_path = os.path.join(results_dir, f"{args.benchmark}_blob_scores.csv")
+    blob_df.to_csv(blob_csv_path, index=False, sep=';')
+    print(f"Blob scores saved to {blob_csv_path}")
 
     # helper for mean
     def _mean(l):
@@ -391,6 +466,10 @@ def save_results(class_dic, evaluator, args, virtual_to_original=None, original_
             original_cid = virtual_to_original.get(cid, cid)
             row['original_class_idx'] = original_cid
             row['original_class_name'] = original_class_dic.get(original_cid, '')
+            orig_g_cid, orig_g_cname = _ground_truth_orig(cid)
+            if orig_g_cid is not None:
+                row['original_ground_truth_class_idx'] = orig_g_cid
+                row['original_ground_truth_class_name'] = orig_g_cname
         class_scores_data.append(row)
         
     class_scores_df = pd.DataFrame(class_scores_data)
@@ -403,6 +482,212 @@ def save_results(class_dic, evaluator, args, virtual_to_original=None, original_
         box_sizes_csv_path = os.path.join(results_dir, f"{args.benchmark}_box_sizes_scores.csv")
         box_sizes_df.to_csv(box_sizes_csv_path, index=False, sep=";")
         print(f"Box sizes saved to {box_sizes_csv_path}")
+
+
+def compute_point_features(mask, pts_xy):
+    """
+    Compute geometry features for a set of positive prompt points against a GT mask.
+
+    Args:
+        mask : 2-D numpy array (H, W), any numeric dtype — will be binarised > 0.
+        pts_xy : numpy array of shape [N, 2] with (x, y) in the SAME pixel frame as mask.
+                 Negative or out-of-bounds points are clipped before use.
+
+    Returns a dict with keys matching the CSV schema.  All features are NaN when
+    the mask is empty or its distance transform has zero interior radius.
+
+    Coordinate-frame contract
+    -------------------------
+    This function is called with `mask = ground_truth` (original-image H×W)
+    and `pts_xy = rescaled_sampled_pts` (positive prompt points, same frame).
+    Both variables are already in the original-image pixel coordinate system
+    before this function is invoked (see the call-site comment in main()).
+
+    Multi-instance handling
+    -----------------------
+    When the GT mask contains multiple disconnected instances (blobs), EDT-based
+    metrics (object_radius_px, coverage_gap_*, dt_depth_*) are computed **per
+    blob** using only the pixels and points that belong to that blob.  The
+    reported scalar is a blob-area-weighted average across all blobs that
+    received at least one prompt point.  Blobs with no points are excluded from
+    the EDT aggregation — point-placement quality is only assessed for the blobs
+    that were actually prompted.
+
+    Global metrics (frac_offmask, dispersion_norm, centroid_offset_norm) still
+    use the full mask/point set, but dispersion_norm and centroid_offset_norm are
+    normalised by the area-weighted mean blob radius (= object_radius_px) so the
+    scale remains comparable across scenes.  For the single-instance case the
+    behaviour is identical to the previous implementation.
+    """
+    nan = float("nan")
+    feat = dict(
+        n_points=0, n_neg_points=0, frac_offmask=nan,
+        object_radius_px=nan,
+        coverage_gap_mean=nan, coverage_gap_p95=nan,
+        dt_depth_mean=nan, dt_depth_min=nan,
+        dispersion_norm=nan, centroid_offset_norm=nan,
+        points_xy="[]",
+    )
+
+    # ── Normalise mask ────────────────────────────────────────────────────────
+    mask_arr = np.array(mask)
+    if mask_arr.ndim > 2:
+        mask_arr = mask_arr.squeeze()
+    M = (mask_arr > 0).astype(np.uint8)  # binary {0, 1}
+
+    H, W = M.shape
+
+    # ── Normalise points ──────────────────────────────────────────────────────
+    if pts_xy is None or len(pts_xy) == 0:
+        return feat
+
+    pts = np.array(pts_xy, dtype=np.float64)
+    if pts.ndim == 3:          # [N, 1, 2] → [N, 2]
+        pts = pts[:, 0, :]
+    assert pts.ndim == 2 and pts.shape[1] == 2, f"pts_xy must be (N,2), got {pts.shape}"
+
+    n_pts = len(pts)
+    feat["n_points"] = n_pts
+    feat["n_neg_points"] = 0
+    feat["points_xy"] = json.dumps([[float(x), float(y)] for x, y in pts])
+
+    # Clip to image bounds for indexing (may be slightly off due to rounding)
+    px = np.clip(np.round(pts[:, 0]).astype(int), 0, W - 1)   # x → col
+    py = np.clip(np.round(pts[:, 1]).astype(int), 0, H - 1)   # y → row
+
+    # ── frac_offmask (global — whole mask) ───────────────────────────────────
+    on_mask_flags = M[py, px] > 0
+    n_on = int(on_mask_flags.sum())
+    feat["frac_offmask"] = float(1.0 - n_on / n_pts)
+
+    if M.sum() == 0:
+        return feat  # empty mask → NaN for all geometry features
+
+    # ── Connected-component labelling ─────────────────────────────────────────
+    # label_map: 0 = background, 1..K = individual foreground blobs.
+    n_labels, label_map, cc_stats, _ = cv2.connectedComponentsWithStats(
+        M, connectivity=8
+    )
+
+    # Which blob does each point fall in? (0 = off-mask / background)
+    pt_blob_ids = label_map[py, px]  # shape [N], values 0..K
+
+    # ── Per-blob EDT metrics ──────────────────────────────────────────────────
+    # Iterate over blobs that contain ≥1 on-mask point; compute all EDT-based
+    # quantities restricted to that blob, normalised by that blob's own
+    # inscribed-circle radius (= max of the blob-local EDT).
+
+    blob_radii    = []   # r per prompted blob
+    blob_areas    = []   # pixel area per prompted blob  (weight)
+    blob_cov_gap_means = []
+    blob_cov_gap_p95s  = []
+    blob_dt_means = []
+    blob_dt_mins  = []
+    blob_centroids = []  # (cx, cy) centre-of-mass per prompted blob
+
+    for blob_label in range(1, n_labels):   # label 0 is background
+        blob_pt_flags = pt_blob_ids == blob_label   # which of the N points land here
+        if not blob_pt_flags.any():
+            continue   # no prompt point in this blob → skip entirely
+
+        # Mask restricted to this single blob
+        blob_M = (label_map == blob_label).astype(np.uint8)
+        blob_area = int(blob_M.sum())
+
+        # EDT and inscribed-circle radius for this blob only
+        blob_dt = scipy_ndimage.distance_transform_edt(blob_M)
+        r_blob = float(blob_dt.max())
+
+        blob_radii.append(r_blob)
+        blob_areas.append(blob_area)
+        cy_b, cx_b = scipy_ndimage.center_of_mass(blob_M)
+        blob_centroids.append((cx_b, cy_b))
+
+        if r_blob == 0:
+            # Degenerate single-pixel blob — EDT metrics are meaningless
+            blob_cov_gap_means.append(nan)
+            blob_cov_gap_p95s.append(nan)
+            blob_dt_means.append(nan)
+            blob_dt_mins.append(nan)
+            continue
+
+        # Coverage gap: nearest-point distance field measured inside this blob only
+        blob_px = px[blob_pt_flags]
+        blob_py = py[blob_pt_flags]
+        seed = np.ones((H, W), dtype=np.uint8)
+        for xi, yi in zip(blob_px, blob_py):
+            seed[yi, xi] = 0
+        dfield = scipy_ndimage.distance_transform_edt(seed)
+        inside = dfield[blob_M > 0]
+        blob_cov_gap_means.append(float(inside.mean()  / r_blob))
+        blob_cov_gap_p95s.append(float(np.percentile(inside, 95) / r_blob))
+
+        # DT depth of the on-blob points, normalised by this blob's radius
+        depths = blob_dt[blob_py, blob_px] / r_blob
+        blob_dt_means.append(float(depths.mean()))
+        blob_dt_mins.append(float(depths.min()))
+
+    # ── Area-weighted aggregation across prompted blobs ───────────────────────
+    def _weighted_mean(values, weights):
+        """Weighted mean, ignoring NaN entries; returns NaN if no valid entry."""
+        v = np.array(values, dtype=np.float64)
+        w = np.array(weights, dtype=np.float64)
+        ok = ~np.isnan(v)
+        if not ok.any():
+            return nan
+        return float(np.average(v[ok], weights=w[ok]))
+
+    if blob_radii:
+        areas_arr = np.array(blob_areas, dtype=np.float64)
+        feat["object_radius_px"]  = _weighted_mean(blob_radii,          areas_arr)
+        feat["coverage_gap_mean"] = _weighted_mean(blob_cov_gap_means,  areas_arr)
+        feat["coverage_gap_p95"]  = _weighted_mean(blob_cov_gap_p95s,   areas_arr)
+        feat["dt_depth_mean"]     = _weighted_mean(blob_dt_means,       areas_arr)
+        feat["dt_depth_min"]      = _weighted_mean(blob_dt_mins,        areas_arr)
+    # else: no on-mask points → all EDT features remain NaN
+
+    # Area-weighted mean blob radius used as global normaliser below.
+    r_global = feat["object_radius_px"]   # NaN if no prompted blob
+
+    # ── Dispersion (global point set, normalised by mean blob radius) ──────────
+    if n_pts >= 2:
+        diffs = pts[:, None, :] - pts[None, :, :]          # [N, N, 2]
+        pair_dists = np.sqrt((diffs ** 2).sum(axis=2))      # [N, N]
+        upper = pair_dists[np.triu_indices(n_pts, k=1)]
+        if not np.isnan(r_global) and r_global > 0:
+            feat["dispersion_norm"] = float(upper.mean() / (2.0 * r_global))
+        # else remain NaN (all points off-mask or degenerate)
+    else:
+        feat["dispersion_norm"] = 0.0
+
+    # ── Centroid offset (mean-pt vs each prompted blob's centroid, weighted) ───
+    if blob_centroids and not np.isnan(r_global) and r_global > 0:
+        mean_pt = pts.mean(axis=0)   # (x_mean, y_mean) of ALL prompt points
+        offsets = [
+            np.sqrt((mean_pt[0] - cx_b) ** 2 + (mean_pt[1] - cy_b) ** 2)
+            for (cx_b, cy_b) in blob_centroids
+        ]
+        areas_arr = np.array(blob_areas, dtype=np.float64)
+        weighted_offset = _weighted_mean(offsets, areas_arr)
+        feat["centroid_offset_norm"] = float(weighted_offset / r_global) \
+            if not np.isnan(weighted_offset) else nan
+
+    return feat
+
+
+def save_point_features_csv(point_feat_rows, args):
+    """Write the point_features CSV alongside the existing sample_scores CSV."""
+    if not point_feat_rows:
+        print("[PointFeatures] No rows to save — skipping point_features CSV.")
+        return
+    results_dir = os.path.join(args.log_dir, args.benchmark)
+    if args.session_name is not None:
+        results_dir = os.path.join(results_dir, args.session_name)
+    os.makedirs(results_dir, exist_ok=True)
+    df = pd.DataFrame(point_feat_rows)
+    csv_path = os.path.join(results_dir, f"{args.benchmark}_point_features.csv")
+    df.to_csv(csv_path, index=False, sep=";")
+    print(f"Point features saved to {csv_path}")
 
 
 def get_random_points_from_mask(mask, num_points):
@@ -562,7 +847,7 @@ def _postprocess_matcher_output(box, points, matched_features, all_target_featur
     return pts_norm_sampled, all_pts_norm, norm_box
 
 
-def get_points_from_matcher(support_imgs=None, support_masks=None, query_img=None, num_points=20, matcher_calculator=None, text_prompt="visual", use_fused_matcher_features=False, skip_coords=False, sampling="random", visualize=False, visual_output_path=None, reference_visual_prompt=None, reference_visual_mask=None, attn_layers="last"):
+def get_points_from_matcher(support_imgs=None, support_masks=None, query_img=None, num_points=20, matcher_calculator=None, text_prompt="visual", use_fused_matcher_features=False, skip_coords=False, sampling="random", visualize=False, visual_output_path=None, reference_visual_prompt=None, reference_visual_mask=None, attn_layers="all"):
     """
     Returns all data in normalized [0,1] coordinates:
       - pts_norm_sampled: [N, 1, 2] normalized sampled points (for SAM3)
@@ -701,7 +986,7 @@ def get_query_self_matching_points(processor=None, support_imgs=None, support_ma
         skip_coords=skip_coords,
         use_query_self_matching=True,
         reference_visual_prompt=aggregated_visual_prompt,
-        reference_visual_mask=aggregated_visual_mask
+        reference_visual_mask=aggregated_visual_mask,
     )
 
     print(f"[QuerySelfMatching] compute_box returned {len(points)} candidate points")
@@ -716,7 +1001,7 @@ def get_query_self_matching_points(processor=None, support_imgs=None, support_ma
 
 def get_attn_prior_points(query_img, text_prompt, num_points, matcher_calculator, attn_layers,
                            visual_prompt=None, visual_prompt_mask=None, attention_aggregate_function="sum",
-                           attn_sampling_mode="top-k", inject_into_image_patches=False):
+                           attn_sampling_mode="top-k", inject_into_image_patches=False, skip_coords=False):
     """
     Sample num_points prompt points from the fusion encoder visual/points cross-attention map.
     Returns norm_pts [num_points, 2] in normalized (x, y) coords.
@@ -730,9 +1015,13 @@ def get_attn_prior_points(query_img, text_prompt, num_points, matcher_calculator
         attn_layers=attn_layers,
         agg_function=attention_aggregate_function,
         inject_into_image_patches=inject_into_image_patches,
+        skip_coords=skip_coords
     )
-    # Point selection uses attention to visual/point tokens (not text)
-    pts_map = matcher_calculator.last_cross_attn_points_map  # [72, 72] numpy
+    # Point selection uses attention to visual/point tokens (not text). But if no support prompts are provided, points tokens are not present, therefore sample from the text map.
+    if visual_prompt is not None:
+        pts_map = matcher_calculator.last_cross_attn_points_map  # [72, 72] numpy
+    else:
+        pts_map = matcher_calculator.last_cross_attn_text_map  # [72, 72] numpy
     H = W = matcher_calculator.encoder_feat_size  # 72
     patch_size = matcher_calculator.encoder_patch_size  # 14
     resolution = float(matcher_calculator.resolution)  # 1008
@@ -855,7 +1144,6 @@ def get_dense_cross_attn_points(processor=None, support_imgs=None, support_masks
     print(f"[DenseCrossAttnPoints] sampled {num_points} points from pre-softmax heatmap (mode={attn_sampling_mode}, layers={attn_layers})")
     return norm_pts.numpy()
 
-
 def _compute_pooled_text(processor, text_prompt):
     """Compute the projected pooled-text bias once per episode. Returns [1, 256]."""
     text_outputs = processor.model.backbone.forward_text([text_prompt], device=processor.device)
@@ -866,7 +1154,6 @@ def _compute_pooled_text(processor, text_prompt):
     pooled_text = encoder.text_pooling_proj(pooled_text)
     print(f"[PooledText] computed pooled-text bias for prompt='{text_prompt}'")
     return pooled_text
-
 
 def _resolve_injection(inject_text_pooling, stage, in_prompts_sampling, in_prompts_inference):
     """Resolve the four injection booleans from the master flag + stage + per-stage in_prompts flags."""
@@ -880,7 +1167,7 @@ def _resolve_injection(inject_text_pooling, stage, in_prompts_sampling, in_promp
     )
 
 
-def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_masks=None, query_img=None, skip_coords=False, num_points=20, matcher_calculator=None, text_prompt="visual", use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, experiment_mode="random", attn_layers="last", inject_text_pooling=False, injection_text_pooling_stage="point_sampling", injection_text_pooling_in_prompts_sampling=False, injection_text_pooling_in_prompts_inference=False, sampling_inputs="both", attention_aggregate_function="sum", attn_sampling_mode="top-k", support_prompt_type="points", blob_selection="largest"):
+def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_masks=None, query_img=None, skip_coords=False, num_points=20, matcher_calculator=None, text_prompt="visual", use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, experiment_mode="random", attn_layers="all", inject_text_pooling=False, injection_text_pooling_stage="point_sampling", injection_text_pooling_in_prompts_sampling=False, injection_text_pooling_in_prompts_inference=False, sampling_inputs="both", attention_aggregate_function="sum", attn_sampling_mode="top-k", support_prompt_type="points", blob_selection="largest", sample_points_from_image=False, fixed_first_pts=None):
     if processor is None:
         raise Exception("Processor is not specified")
     if support_imgs is None:
@@ -928,7 +1215,13 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
                 _sampling_vp, _sampling_vm = encode_support_visual_tokens(
                     processor, support_imgs, support_masks, num_points, skip_coords, tag="Sampling"
                 )
-        _include_text = (sampling_inputs != "support_only")
+        # if the sampling_inputs is support only, then the text_prompt is "visual" (text must not be disabled in the literal sense, if no text_prompt is given, "visual" is used to tell SAM3 to segment the exemplars)
+
+    # support_only: replace class label with "visual" sentinel in the sampling/matching pass.
+    # Applies to attn_prior and self_attn (fusion encoder sampling pass) AND matcher
+    # (fusion encoder feature extraction pass when use_fused_matcher_features=True).
+    if sampling_inputs == "support_only" and experiment_mode in ("attn_prior", "self_attn", "matcher"):
+        text_prompt = "visual"
 
     # Resolve injection booleans + compute pooled_text once per call (shared across all stages and branches).
     inj_sampling, inj_inference, inj_prompts_sampling, inj_prompts_inference = _resolve_injection(
@@ -950,23 +1243,26 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
 
     if experiment_mode == "dense_cross_attn":
         # Exp 6: dense cross-attention heatmap → sample prompt points
-        result = get_dense_cross_attn_points(
-            processor=processor,
-            support_imgs=support_imgs,
-            support_masks=support_masks,
-            visual_prompt=_sampling_vp, visual_prompt_mask=_sampling_vm,
-            query_img=query_img,
-            num_points=num_points,
-            matcher_calculator=matcher_calculator,
-            text_prompt=text_prompt,
-            skip_coords=skip_coords,
-            attn_layers=attn_layers,
-            inject_into_image_patches=inj_sampling,
-            inject_into_support_feats=inj_prompts_sampling,
-            pooled_text=pooled_text,
-            attention_aggregate_function=attention_aggregate_function,
-            attn_sampling_mode=attn_sampling_mode,
-        )
+        if fixed_first_pts is None:
+            result = get_dense_cross_attn_points(
+                processor=processor,
+                support_imgs=support_imgs,
+                support_masks=support_masks,
+                visual_prompt=_sampling_vp, visual_prompt_mask=_sampling_vm,
+                query_img=query_img,
+                num_points=num_points,
+                matcher_calculator=matcher_calculator,
+                text_prompt=text_prompt,
+                skip_coords=skip_coords,
+                attn_layers=attn_layers,
+                inject_into_image_patches=inj_sampling,
+                inject_into_support_feats=inj_prompts_sampling,
+                pooled_text=pooled_text,
+                attention_aggregate_function=attention_aggregate_function,
+                attn_sampling_mode=attn_sampling_mode,
+            )
+        else:
+            result = fixed_first_pts
         pts_norm = result
         if pts_norm is not None:
             # previous experiments showed that skip_coords=False is a lot worse for points on the query image
@@ -978,18 +1274,22 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
             all_visual_masks.append(state["prompt_mask"])
             norm_pts_sampled = pts_norm
             all_norm_pts = pts_norm
-        
+        else:
+            raise Exception("No points sampled for query image")
     elif experiment_mode == "self_attn":
         # Exp 7: bottom-k points from fusion encoder self-attention map
-        pts_norm = get_self_attn_points(
-            query_img, text_prompt, num_points, matcher_calculator, attn_layers,
-            visual_prompt=_sampling_vp, visual_prompt_mask=_sampling_vm,
-            include_text_in_prompt=_include_text,
-            attention_aggregate_function=attention_aggregate_function,
-            attn_sampling_mode=attn_sampling_mode,
-            skip_coords=skip_coords,
-            inject_into_image_patches=inj_sampling,
-        )
+        if fixed_first_pts is None:
+            pts_norm = get_self_attn_points(
+                query_img, text_prompt, num_points, matcher_calculator, attn_layers,
+                visual_prompt=_sampling_vp, visual_prompt_mask=_sampling_vm,
+                # include_text_in_prompt=_include_text,
+                attention_aggregate_function=attention_aggregate_function,
+                attn_sampling_mode=attn_sampling_mode,
+                skip_coords=skip_coords,
+                inject_into_image_patches=inj_sampling,
+            )
+        else:
+            pts_norm = fixed_first_pts
         if pts_norm is not None:
             # previous experiments showed that skip_coords=False is a lot worse for points on the query image
             # skip_coords=True is usually better when encoding prompts from support to query fusion
@@ -1000,15 +1300,21 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
             all_visual_masks.append(state["prompt_mask"])
             norm_pts_sampled = pts_norm
             all_norm_pts = pts_norm
+        else:
+            raise Exception("No points sampled for query image")
     elif experiment_mode == "attn_prior":
         # Exp 5: top-k points from fusion encoder cross-attention map
-        pts_norm = get_attn_prior_points(
-            query_img, text_prompt, num_points, matcher_calculator, attn_layers,
-            visual_prompt=_sampling_vp, visual_prompt_mask=_sampling_vm,
-            attention_aggregate_function=attention_aggregate_function,
-            attn_sampling_mode=attn_sampling_mode,
-            inject_into_image_patches=inj_sampling,
-        )
+        if fixed_first_pts is None:
+            pts_norm = get_attn_prior_points(
+                query_img, text_prompt, num_points, matcher_calculator, attn_layers,
+                visual_prompt=_sampling_vp, visual_prompt_mask=_sampling_vm,
+                attention_aggregate_function=attention_aggregate_function,
+                attn_sampling_mode=attn_sampling_mode,
+                inject_into_image_patches=inj_sampling,
+                skip_coords=skip_coords
+            )
+        else:
+            pts_norm = fixed_first_pts
         if pts_norm is not None:
             # previous experiments showed that skip_coords=False is a lot worse for points on the query image
             # skip_coords=True is usually better when encoding prompts from support to query fusion
@@ -1019,6 +1325,8 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
             all_visual_masks.append(state["prompt_mask"])
             norm_pts_sampled = pts_norm
             all_norm_pts = pts_norm
+        else:
+            raise Exception("No points sampled for query image")
     elif experiment_mode == "self_matching":
         # Exp 4: query self-matching mode
         pts_norm, all_pts_norm, box_norm = get_query_self_matching_points(
@@ -1035,7 +1343,7 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
             visual_output_path=visual_output_path
         )
         if pts_norm is not None:
-            state = encode_pts_prompts(processor, query_img, pts_norm, skip_coords)
+            state = encode_pts_prompts(processor, query_img, pts_norm, True)
             all_visual_tokens.append(state["prompt"])
             all_visual_masks.append(state["prompt_mask"])
             norm_pts_sampled = pts_norm
@@ -1050,9 +1358,10 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
             text_prompt=text_prompt, use_fused_matcher_features=use_fused_matcher_features,
             skip_coords=skip_coords, sampling=sampling, visualize=visualize,
             visual_output_path=visual_output_path,
+            attn_layers=attn_layers
         )
         if pts_norm is not None:
-            state = encode_pts_prompts(processor, query_img, pts_norm, skip_coords)
+            state = encode_pts_prompts(processor, query_img, pts_norm, True)
             all_visual_tokens.append(state["prompt"])
             all_visual_masks.append(state["prompt_mask"])
             norm_pts_sampled = pts_norm
@@ -1075,7 +1384,21 @@ def get_prompt_tokens_from_support(processor=None, support_imgs=None, support_ma
                 prompt = state["prompt"]
                 mask = state["prompt_mask"]
             else:
-                pts_norm, pts_actual = get_random_points_from_mask(mask=support_mask, num_points=num_points)
+                mask = support_mask
+                if sample_points_from_image:
+                    mask = torch.ones(support_mask.shape, dtype=torch.float32)
+                if fixed_first_pts is None:
+                    pts_norm, pts_actual = get_random_points_from_mask(mask=mask, num_points=num_points)
+                else:
+                    pts_norm = fixed_first_pts
+                    # Recompute pixel-space coordinates from the fixed normalised points.
+                    # pts_norm: [N, 1, 2] floats in [0,1] (x, y); mask shape: (..., H, W).
+                    # Must match the shape returned by get_random_points_from_mask: [N, 2] int.
+                    _H, _W = support_mask.shape[-2], support_mask.shape[-1]
+                    _pts2d = np.asarray(pts_norm)[:, 0, :]  # [N, 2]
+                    pts_actual = np.stack(
+                        [(_pts2d[:, 0] * _W).astype(int), (_pts2d[:, 1] * _H).astype(int)], axis=1
+                    )  # [N, 2]
                 if pts_norm is None:
                     raise Exception(f"Mask for support image {idx} is empty. No points have been returned.")
                 print(f"[PromptTokens] support {idx+1}/{support_imgs.shape[0]} - encoding {len(pts_norm)} random points from mask")
@@ -1145,7 +1468,7 @@ def update_state_with_support_prompt(state=None, prompt=None, prompt_mask=None, 
     
     return state
 
-def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, support_masks=None, text_prompt="visual", skip_coords=False, num_points=20, matcher_calculator=None, use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, experiment_mode="random", attn_layers="last", inject_text_pooling=False, injection_text_pooling_stage="point_sampling", injection_text_pooling_in_prompts_sampling=False, injection_text_pooling_in_prompts_inference=False, sampling_inputs="both", attention_aggregate_function="sum", attn_sampling_mode="top-k", support_prompt_type="points", blob_selection="largest"):
+def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, support_masks=None, text_prompt="visual", skip_coords=False, num_points=20, matcher_calculator=None, use_fused_matcher_features=False, sampling="random", visualize=False, visual_output_path=None, experiment_mode="random", attn_layers="all", inject_text_pooling=False, injection_text_pooling_stage="point_sampling", injection_text_pooling_in_prompts_sampling=False, injection_text_pooling_in_prompts_inference=False, sampling_inputs="both", attention_aggregate_function="sum", attn_sampling_mode="top-k", support_prompt_type="points", blob_selection="largest", sample_points_from_image=False, disable_text_inference=False, fixed_first_pts=None, has_dedicated_pass=False, attention_maps_output_dir=None, img_numpy=None, frame_tag=None):
     if sam3 is None:
         raise Exception("SAM3 is not specified")
     elif query_frame is None:
@@ -1183,10 +1506,21 @@ def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, suppo
         injection_text_pooling_stage=injection_text_pooling_stage,
         injection_text_pooling_in_prompts_sampling=injection_text_pooling_in_prompts_sampling,
         injection_text_pooling_in_prompts_inference=injection_text_pooling_in_prompts_inference,
+        sample_points_from_image=sample_points_from_image,
+        fixed_first_pts=fixed_first_pts
     )
+
+    # save the sampling pass attention maps
+    if has_dedicated_pass and matcher_calculator is not None:
+        # matcher_calculator.collect_inference_attn(
+        #     attn_layers, matcher_calculator.last_num_text_tokens, attention_aggregate_function
+        # )
+        save_attention_maps(matcher_calculator, attention_maps_output_dir, attn_layers, frame_tag, img_numpy)
+        matcher_calculator.arm_inference_capture(attn_layers)
+
     final_prompt, final_mask, text_outputs = aggregate_prompt_with_text_tokens(
         processor=sam3.processor,
-        text_prompt=text_prompt,
+        text_prompt=text_prompt if not disable_text_inference else "visual",
         aggregated_visual_prompt=visual_prompt,
         aggregated_visual_mask=visual_mask
     )
@@ -1213,6 +1547,35 @@ def cross_image_prediction(sam3=None, query_frame=None, support_imgs=None, suppo
     merged_mask = np.any(np.array(state['masks'].cpu()), axis=0).squeeze(0)
     return merged_mask, norm_pts_sampled, all_norm_pts, norm_box, actual_pts_sampled, support_boxes
 
+def save_attention_maps(matcher_calculator=None, vid_attn_dir=None, _sfx=None, frame_tag=0, img_numpy=None):
+    if matcher_calculator is None or vid_attn_dir is None or _sfx is None or frame_tag is None or img_numpy is None:
+        raise ValueError("Missing arguments for saving attention maps")
+    
+    for _map_name, _attn_map in [
+        ("cross_total",  matcher_calculator.last_cross_attn_map),
+        ("cross_text",   matcher_calculator.last_cross_attn_text_map),
+        ("cross_points", matcher_calculator.last_cross_attn_points_map),
+        ("self",         matcher_calculator.last_self_attn_map),
+    ]:
+        if _attn_map is not None:
+            save_attn_heatmap(
+                img_numpy, _attn_map,
+                os.path.join(vid_attn_dir, f"frame_{frame_tag}_{_map_name}_{_sfx}.png")
+            )
+
+    for _map_name, _attn_map_list in [
+        ("self", matcher_calculator.all_self_attn_maps),
+        ("cross", matcher_calculator.all_cross_attn_maps),
+        ("cross_text", matcher_calculator.all_cross_attn_text_maps),
+        ("cross_points", matcher_calculator.all_cross_attn_points_maps),
+    ]:
+        if _attn_map_list is not None:
+            for num_layer, _attn_map in enumerate(_attn_map_list):
+                if _attn_map is not None:
+                    save_attn_heatmap(
+                        img_numpy, _attn_map,
+                        os.path.join(vid_attn_dir, f"frame_{frame_tag}_layer_{num_layer}_{_map_name}.png")
+                    )
 
 def main():
     args = get_arguments()
@@ -1240,9 +1603,40 @@ def main():
     # )
 
     dataset = loader.dataset
-        
-    class_list = dataset.get_class_ids()
+
+    # ── Shard: slice class list into num_shards disjoint parts ───────────────
+    # Sort deterministically so every shard gets a stable, reproducible subset.
+    # Slicing is done on the *class* axis (not the raw item index) so that every
+    # image of a given class always belongs to exactly one shard.
+    class_list = sorted(dataset.get_class_ids())
+    if args.num_shards > 1:
+        if not (0 <= args.shard_id < args.num_shards):
+            raise ValueError(
+                f"--shard_id {args.shard_id} is out of range for --num_shards {args.num_shards}"
+            )
+        total_classes = len(class_list)
+        # Compute inclusive [start_c, end_c) slice for this shard.
+        # Integer division distributes remainder classes to the first shards.
+        base, remainder = divmod(total_classes, args.num_shards)
+        start_c = args.shard_id * base + min(args.shard_id, remainder)
+        end_c   = start_c + base + (1 if args.shard_id < remainder else 0)
+        class_list = class_list[start_c:end_c]
+        print(
+            f"[Sharding] shard {args.shard_id}/{args.num_shards}: "
+            f"classes {start_c}..{end_c-1} of {total_classes} total "
+            f"({len(class_list)} classes)"
+        )
+        # Auto-suffix session_name so each shard writes to its own log dir.
+        if args.session_name is not None:
+            args.session_name = f"{args.session_name}_shard{args.shard_id}of{args.num_shards}"
+        else:
+            args.session_name = f"shard{args.shard_id}of{args.num_shards}"
+    # Set of class IDs to process in this shard (O(1) membership test in the loop)
+    shard_class_set = set(class_list)
+    # ─────────────────────────────────────────────────────────────────────────
+
     class_dic = dataset.idx_to_classname
+    grond_truth_class_dic = dataset.idx_to_ground_truth_label
     original_class_dic = dict(class_dic)  # Save before overwriting
     if args.all_lemmas:
         # Build mapping: original class_id → [(virtual_id, lemma_text), ...]
@@ -1271,7 +1665,9 @@ def main():
     start_time = time.perf_counter()
 
     box_coordinates = []
-
+    # Accumulates one dict per (sample_id, eval_id) for the point_features CSV.
+    point_feat_rows = []
+    
     print("STARTING SEGMENTATION")
     print("-" * 50)
     with torch.no_grad():
@@ -1284,7 +1680,11 @@ def main():
             torch.manual_seed(current_seed)
 
             data = loader[idx]
-            
+
+            # Skip items whose class does not belong to this shard.
+            if data['class_id'] not in shard_class_set:
+                continue
+
             query_imgs = data['query_imgs']
             query_masks = data['query_masks']
             support_imgs = data['support_imgs']
@@ -1314,6 +1714,31 @@ def main():
             else:
                 lemma_entries = [(class_id, class_name)]
 
+            # Always place the canonical selected lemma first whenever all_lemmas is
+            # active. This guarantees a consistent virtual-class ordering across all
+            # experiment types (FREE, FIXED, random, attention-based, etc.) so that
+            # the selected lemma always occupies the lowest virtual ID and the first
+            # iteration of the inner lemma loop. For attention experiments this is
+            # critical: the first lemma's text prompt determines the attention map and
+            # therefore the sampled point coordinates, so a different ordering produces
+            # different points. For random/matcher experiments the ordering is a no-op
+            # in practice (points are drawn from the mask, not from the lemma text),
+            # but consistent ordering is still preferable for reproducibility.
+            if args.all_lemmas:
+                selected_lemma_text = original_class_dic[class_id]
+                lemma_entries = sorted(
+                    lemma_entries,
+                    key=lambda e: 0 if e[1] == selected_lemma_text else 1
+                )
+                print(f"  [Lemma ordering] Selected lemma '{selected_lemma_text}' placed first")
+                assert lemma_entries[0][1] == selected_lemma_text, (
+                    f"[BUG] Selected lemma '{selected_lemma_text}' is NOT first for class {class_id} "
+                    f"(original name: '{original_class_dic.get(class_id, '?')}')! "
+                    f"First entry is '{lemma_entries[0][1]}'. "
+                    f"Full order: {[e[1] for e in lemma_entries]}"
+                )
+
+            first_pts = None
             for eval_id, lemma in lemma_entries:
                 if args.all_lemmas:
                     print(f"  Prompting with lemma: '{lemma}' (eval_id: {eval_id})")
@@ -1322,6 +1747,8 @@ def main():
                 vid_ground_truth_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "ground_truth")
                 vid_frames_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "frames")
                 vid_attn_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "attention_maps")
+                vid_attn_sampling_dir = os.path.join(vid_attn_dir, f"sampling_maps")
+                vid_attn_inference_dir = os.path.join(vid_attn_dir, f"inference_maps")
                 if args.experiment_mode == "matcher":
                     vid_box_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "bounding_box")
 
@@ -1329,6 +1756,8 @@ def main():
                 os.makedirs(vid_ground_truth_dir, exist_ok=True)
                 os.makedirs(vid_frames_dir, exist_ok=True)
                 os.makedirs(vid_attn_dir, exist_ok=True)
+                os.makedirs(vid_attn_sampling_dir, exist_ok=True)
+                os.makedirs(vid_attn_inference_dir, exist_ok=True)
                 if args.experiment_mode == "matcher":
                     os.makedirs(vid_box_dir, exist_ok=True)
 
@@ -1336,6 +1765,9 @@ def main():
                 ground_truths = []
                 point_scores_list = []
                 all_point_scores_list = []
+                # Per-frame geometry feature accumulator for this (sample, lemma).
+                # Each entry is a feat-dict from compute_point_features().
+                _frame_feat_list = []
 
                 # Save support images and their mask overlays
                 if support_imgs is not None:
@@ -1355,7 +1787,7 @@ def main():
                     print(f"query_frame shape: {query_frame.shape}")
                     print(f"ground_truth shape: {ground_truth.shape}")
                     
-                    _text = lemma if not args.disable_text else "visual"
+                    _text = lemma
                     if args.use_query_as_support:
                         _sup_imgs  = query_frame.unsqueeze(0)
                         _sup_masks = ground_truth.unsqueeze(0)
@@ -1363,9 +1795,13 @@ def main():
                         _sup_imgs  = support_imgs
                         _sup_masks = support_masks
 
+                    # has_dedicated_pass == True if the experiment requires a sampling pass. 
+                    # Already set the SAM3 fusion encoder layers to store attention maps
+                    # If instead the exp requires the sampling, the storing and saving is delegated to the sampling function in "cross_image_prediction"
                     has_dedicated_pass = args.experiment_mode in (
                         "attn_prior", "dense_cross_attn", "self_attn"
-                    )
+                    ) or (args.experiment_mode == "matcher" and args.use_fused_matcher_features)
+
                     if not has_dedicated_pass:
                         matcher_calculator.arm_inference_capture(args.attn_layers)
 
@@ -1388,7 +1824,7 @@ def main():
                         use_fused_matcher_features=args.use_fused_matcher_features,
                         sampling=args.sampling,
                         visualize=args.visualize_embeddings,
-                        visual_output_path=os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}_tsne.png") if args.visualize_embeddings and args.experiment_mode == "matcher" else None,
+                        visual_output_path=os.path.join(vid_box_dir, f"frame_0_tsne.png") if args.visualize_embeddings and args.experiment_mode == "matcher" else None,
                         experiment_mode=args.experiment_mode,
                         attn_layers=args.attn_layers,
                         inject_text_pooling=args.inject_text_pooling,
@@ -1400,7 +1836,18 @@ def main():
                         attn_sampling_mode=args.attn_sampling_mode,
                         support_prompt_type=args.support_prompt_type,
                         blob_selection=args.blob_selection,
+                        sample_points_from_image=args.sample_points_from_image,
+                        disable_text_inference=args.disable_text_inference,
+                        fixed_first_pts=first_pts if args.fix_sampled_points else None,
+                        has_dedicated_pass=has_dedicated_pass,
+                        attention_maps_output_dir=vid_attn_sampling_dir,
+                        img_numpy=img_numpy,
+                        frame_tag=chosen_frames[frame_idx]
                     )
+
+                    if args.fix_sampled_points and first_pts is None:
+                        first_pts = norm_pts_sampled
+                        print(f"  [fix_sampled_points] Captured first_pts from lemma '{lemma}' (shape: {first_pts.shape if first_pts is not None else None})")
 
                     # Save support bbox visualizations (one image per support shot)
                     if support_boxes is not None:
@@ -1413,12 +1860,11 @@ def main():
                                 pixel_box = rescale_to_pixel(norm_xyxy, (W_s, H_s))
                                 save_image_with_box(s_img_numpy, pixel_box, os.path.join(vid_frames_dir, f"support_{s_idx}_bbox.png"))
 
-                    # if we had a dedicated pass to compute the points to prompt the query image, we'd overwrite the attn maps with the ones of the inference pass
-                    # is instead we just did an inference or matcher pass, we need to collect the attention maps from the inference pass
-                    if not has_dedicated_pass:
-                        matcher_calculator.collect_inference_attn(
-                            args.attn_layers, matcher_calculator.last_num_text_tokens, args.attention_aggregate_function
-                        )
+                    # (if we had a dedicated pass to compute the points to prompt the query image, we'd overwrite the attn maps with the ones of the inference pass is instead we just did an inference or matcher pass, we need to collect the attention maps from the inference pass)
+                    # This save is going to change to be dedicated for the saving of the attention maps of the inference pass (the inference pass is going to be always saved, the optional one becomes the sampling pass). We can assume the sampling pass attention maps have already been saved, so we can collect the inference attention maps right away, regardless of the experiment mode.
+                    matcher_calculator.collect_inference_attn(
+                        args.attn_layers, matcher_calculator.last_num_text_tokens, args.attention_aggregate_function
+                    )
 
                     img_pil = Image.fromarray(img_numpy)
                     save_image(img_pil, os.path.join(vid_frames_dir, f"frame_{chosen_frames[frame_idx]}_input.png"))
@@ -1462,31 +1908,32 @@ def main():
                     # Save all attention maps for this frame
                     frame_tag = chosen_frames[frame_idx]
                     _sfx = args.attn_layers
-                    for _map_name, _attn_map in [
-                        ("cross_total",  matcher_calculator.last_cross_attn_map),
-                        ("cross_text",   matcher_calculator.last_cross_attn_text_map),
-                        ("cross_points", matcher_calculator.last_cross_attn_points_map),
-                        ("self",         matcher_calculator.last_self_attn_map),
-                    ]:
-                        if _attn_map is not None:
-                            save_attn_heatmap(
-                                img_numpy, _attn_map,
-                                os.path.join(vid_attn_dir, f"frame_{frame_tag}_{_map_name}_{_sfx}.png")
-                            )
+                    save_attention_maps(matcher_calculator, vid_attn_inference_dir, _sfx, frame_tag, img_numpy)
+                    # for _map_name, _attn_map in [
+                    #     ("cross_total",  matcher_calculator.last_cross_attn_map),
+                    #     ("cross_text",   matcher_calculator.last_cross_attn_text_map),
+                    #     ("cross_points", matcher_calculator.last_cross_attn_points_map),
+                    #     ("self",         matcher_calculator.last_self_attn_map),
+                    # ]:
+                    #     if _attn_map is not None:
+                    #         save_attn_heatmap(
+                    #             img_numpy, _attn_map,
+                    #             os.path.join(vid_attn_dir, f"frame_{frame_tag}_{_map_name}_{_sfx}.png")
+                    #         )
 
-                    for _map_name, _attn_map_list in [
-                        ("self", matcher_calculator.all_self_attn_maps),
-                        ("cross", matcher_calculator.all_cross_attn_maps),
-                        ("cross_text", matcher_calculator.all_cross_attn_text_maps),
-                        ("cross_points", matcher_calculator.all_cross_attn_points_maps),
-                    ]:
-                        if _attn_map_list is not None:
-                            for num_layer, _attn_map in enumerate(_attn_map_list):
-                                if _attn_map is not None:
-                                    save_attn_heatmap(
-                                        img_numpy, _attn_map,
-                                        os.path.join(vid_attn_dir, f"frame_{frame_tag}_layer_{num_layer}_{_map_name}.png")
-                                    )
+                    # for _map_name, _attn_map_list in [
+                    #     ("self", matcher_calculator.all_self_attn_maps),
+                    #     ("cross", matcher_calculator.all_cross_attn_maps),
+                    #     ("cross_text", matcher_calculator.all_cross_attn_text_maps),
+                    #     ("cross_points", matcher_calculator.all_cross_attn_points_maps),
+                    # ]:
+                    #     if _attn_map_list is not None:
+                    #         for num_layer, _attn_map in enumerate(_attn_map_list):
+                    #             if _attn_map is not None:
+                    #                 save_attn_heatmap(
+                    #                     img_numpy, _attn_map,
+                    #                     os.path.join(vid_attn_dir, f"frame_{frame_tag}_layer_{num_layer}_{_map_name}.png")
+                    #                 )
 
                     # Points overlay on the visual/points-prior map
                     if rescaled_sampled_pts is not None and matcher_calculator.last_cross_attn_points_map is not None:
@@ -1510,18 +1957,78 @@ def main():
                     if norm_box is not None:
                         box_coordinates.append(convert_norm_box_to_sam3_format(norm_box))
 
+                    # ── Point-feature logging (inline, same coordinate frame) ────────────
+                    # `ground_truth`        : original-image H×W GT mask (from query_masks)
+                    # `rescaled_sampled_pts`: positive prompt points scaled to the same
+                    #                         original-image pixel frame (actual_w × actual_h)
+                    # Both variables are already in the original-image pixel coordinate
+                    # system at this point in the loop, so no further reprojection needed.
+                    _gt_for_feat = ground_truth.cpu().numpy() if hasattr(ground_truth, 'cpu') else np.array(ground_truth)
+                    _pts_for_feat = rescaled_sampled_pts  # [N,2] or None
+                    _feat = compute_point_features(_gt_for_feat, _pts_for_feat)
+                    _frame_feat_list.append(_feat)
+
                     predictions.append(prediction)
                     ground_truths.append(ground_truth)
 
                 evaluator.update_evl(eval_id, ground_truths, predictions, sample_id=f"{dir_name}_{eval_id}_{idx}", points_list=point_scores_list, all_points_list=all_point_scores_list)
                 print(f"Updated evaluation metrics for '{lemma}'")
 
+                # ── Aggregate per-frame geometry features → one row per (sample, lemma) ──
+                # j_score is now available in evaluator.sample_details for this eval_id.
+                _class_internal_id = evaluator.class_indexes.index(eval_id)
+                _last_detail = evaluator.sample_details[_class_internal_id][-1]
+                _sample_j_score = float(_last_detail["j_score"])
+
+                if _frame_feat_list:
+                    # Average numeric geometry features across frames; keep
+                    # points_xy from the first frame (representative).
+                    _avg_feat = {}
+                    _numeric_keys = [
+                        "n_points", "n_neg_points", "frac_offmask",
+                        "object_radius_px",
+                        "coverage_gap_mean", "coverage_gap_p95",
+                        "dt_depth_mean", "dt_depth_min",
+                        "dispersion_norm", "centroid_offset_norm",
+                    ]
+                    for _k in _numeric_keys:
+                        _vals = [f[_k] for f in _frame_feat_list
+                                 if not (isinstance(f[_k], float) and np.isnan(f[_k]))]
+                        _avg_feat[_k] = float(np.mean(_vals)) if _vals else float("nan")
+                    _avg_feat["points_xy"] = _frame_feat_list[0]["points_xy"]
+
+                    _orig_cid = virtual_to_original.get(eval_id, eval_id) if virtual_to_original else eval_id
+                    _orig_cname = original_class_dic.get(_orig_cid, "") if original_class_dic else ""
+
+                    _row = {
+                        "class_id":            eval_id,
+                        "class_name":          lemma,
+                        "sample_id":           f"{dir_name}_{eval_id}_{idx}",
+                        "original_class_idx":  _orig_cid,
+                        "original_class_name": _orig_cname,
+                        "fold":                args.fold,
+                        "run":                 args.run_n,
+                        "j_score":             _sample_j_score,
+                        "points_xy":           _avg_feat["points_xy"],
+                        "n_points":            int(_avg_feat["n_points"]),
+                        "n_neg_points":        int(_avg_feat["n_neg_points"]),
+                        "frac_offmask":        _avg_feat["frac_offmask"],
+                        "object_radius_px":    _avg_feat["object_radius_px"],
+                        "coverage_gap_mean":   _avg_feat["coverage_gap_mean"],
+                        "coverage_gap_p95":    _avg_feat["coverage_gap_p95"],
+                        "dt_depth_mean":       _avg_feat["dt_depth_mean"],
+                        "dt_depth_min":        _avg_feat["dt_depth_min"],
+                        "dispersion_norm":     _avg_feat["dispersion_norm"],
+                        "centroid_offset_norm": _avg_feat["centroid_offset_norm"],
+                    }
+                    point_feat_rows.append(_row)
+
+
             if (idx + 1) % 10 == 0:
                 current_time = time.perf_counter()
                 elapsed_so_far = current_time - start_time
                 avg_time_per_img = elapsed_so_far / (idx + 1)
                 print(f">>> Processate {idx + 1} immagini in {elapsed_so_far:.2f} sec (Media: {avg_time_per_img:.2f} sec/img)")
-
     print("-" * 50)
 
     end_time = time.perf_counter()
@@ -1549,7 +2056,8 @@ def main():
 
     clean_score_dict = {k: v.tolist() if hasattr(v, 'tolist') else v for k, v in score_dict.items()}
 
-    save_results(class_dic, evaluator, args, virtual_to_original=virtual_to_original, original_class_dic=original_class_dic, box_coordinates=box_coordinates)
+    save_results(class_dic, evaluator, args, virtual_to_original=virtual_to_original, original_class_dic=original_class_dic, box_coordinates=box_coordinates, grond_truth_class_dic=grond_truth_class_dic)
+    save_point_features_csv(point_feat_rows, args)
 
     # PRINT RESULTS
     print("\n\n")

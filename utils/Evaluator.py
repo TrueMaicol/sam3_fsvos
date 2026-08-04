@@ -1,5 +1,6 @@
 import numpy as np
 from utils.davis_JF import db_eval_boundary, db_eval_iou
+from utils.blob_evaluation import blob_analysis
 import torch
 
 def measure(y_in, pred_in):
@@ -76,6 +77,8 @@ class Evaluator():
 
         self.pt_accuracy_macro = [0] * self.num_classes
         self.all_point_accuracy_macro = [0] * self.num_classes
+
+        self.blob_results = [[] for _ in range(self.num_classes)]
         
     def evaluate_points_overlap(self, rescaled_pts, gt_mask):
         """
@@ -199,6 +202,9 @@ class Evaluator():
                 self.all_pt_sum_ratios[id] += all_pt_score
                 self.all_pt_ratios_count[id] += 1
 
+            pts_for_blob = points_list[j] if (points_list is not None and j < len(points_list)) else None
+            blob_results = blob_analysis(ground_truth_masks[j], pts_for_blob) if pts_for_blob is not None else []
+
             # sample_details contains the IoU for each individual image, and the relative pixel ratio w.r.t. the gt. We cannot use the tp/total because that's an incremental approach, and we need an atomic value for each image
             self.sample_details[id].append({
                 "sample_id": sample_id,
@@ -207,8 +213,9 @@ class Evaluator():
                 "pixel_ratio": ratio,
                 "point_score": pt_score,
                 "all_point_score": all_pt_score,
-                "num_total_points": len(points_list), # record the total number of points computed by Matcher upon this sample
-                "size_category": "SMALL" if ratio < self.threshold["SMALL"] else "MEDIUM" if ratio < self.threshold["MEDIUM"] else "LARGE"
+                "num_total_points": len(all_points_list[j]) if (all_points_list is not None and j < len(all_points_list) and all_points_list[j] is not None) else 0, # record the total number of points computed by Matcher upon this sample
+                "size_category": "SMALL" if ratio < self.threshold["SMALL"] else "MEDIUM" if ratio < self.threshold["MEDIUM"] else "LARGE",
+                "blob_results": blob_results
             })
 
             if self.verbose:

@@ -59,8 +59,9 @@ class COCO20i_Dataset(Dataset):
         self.coco_id_to_idx = {id: i for i, id in enumerate(COCO_ORIGINAL_IDS)}
 
         self.class_ids = self.build_class_ids()
-
+        self.idx_to_ground_truth_label = {}
         self.class_idx_to_all_lemmas = {}
+        
         if self.use_synset_names:
             synset_mapping = pd.read_csv(self.synset_mapping_csv_path, sep="|")
             self.idx_to_classname = {}
@@ -84,6 +85,7 @@ class COCO20i_Dataset(Dataset):
                     # Fallback to standard mapping if CSV lookup fails
                     print("No match found for COCO ID {}".format(original_coco_id))
                     self.idx_to_classname[idx] = COCO_ID_LABELS_MAPPING[idx]
+            self.idx_to_ground_truth_label = {idx: COCO_ID_LABELS_MAPPING[idx] for idx in self.class_ids}
         else:
             self.idx_to_classname = {idx: COCO_ID_LABELS_MAPPING[idx] for idx in self.class_ids}
 
@@ -100,10 +102,13 @@ class COCO20i_Dataset(Dataset):
         # ignores idx during training & testing and perform uniform sampling over object classes to form an episode
         # (due to the large size of the COCO dataset)
         query_img, query_mask, support_imgs, support_masks, query_name, support_names, class_sample, org_qry_imsize = self.load_frame()
-
         if self.transform is not None:
             query_img, query_mask = self.transform([query_img], [query_mask])
-            support_imgs, support_masks = self.transform(support_imgs, support_masks)
+            if self.shot > 0:
+                support_imgs, support_masks = self.transform(support_imgs, support_masks)
+            else:
+                support_imgs = torch.tensor([])
+                support_masks = torch.tensor([])
             
 
         # query_mask = query_mask.float()
@@ -181,15 +186,16 @@ class COCO20i_Dataset(Dataset):
         query_name = np.random.choice(self.img_metadata_classwise[class_sample], 1, replace=False)[0]
         query_img = np.array(Image.open(os.path.join(self.data_dir, query_name)).convert('RGB'))
         query_mask = self.read_mask(query_name, class_sample)
-
         org_qry_imsize = query_img.size
 
         support_names = []
-        while True:  # keep sampling support set if query == support
-            support_name = np.random.choice(self.img_metadata_classwise[class_sample], 1, replace=False)[0]
-            if query_name != support_name: support_names.append(support_name)
-            if len(support_names) == self.shot: break
-
+        if self.shot > 0:
+            while True:  # keep sampling support set if query == support
+                support_name = np.random.choice(self.img_metadata_classwise[class_sample], 1, replace=False)[0]
+                if query_name != support_name:
+                    support_names.append(support_name)
+                if len(support_names) == self.shot:
+                    break
         support_imgs = []
         support_masks = []
         for support_name in support_names:

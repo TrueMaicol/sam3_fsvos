@@ -49,17 +49,17 @@ def get_arguments():
         parser.add_argument("--frame_num", type=int, default=2)
         parser.add_argument("--nshot", type=int, default=0)
         parser.add_argument("--use_synset_names", action="store_true", default=False)
-        parser.add_argument("--synset_mapping_folder_path", type=str, default="/leonardo_work/IscrC_MARSv2/datasets/synset_mappings")
+        parser.add_argument("--synset_mapping_folder_path", type=str, default="/megaverse/storage/samele/FSS-SAM3/datasets/synset_mappings/leaf")
         parser.add_argument("--use_grouping_ade20k", action="store_true", default=False, help="Enable grouping of classes using JSON [ONLY ON ADE20K].")
         parser.add_argument("--all_lemmas", action="store_true", default=False, help="Iterate over all lemmas, instead of just the one selected inside the mapping")
         parser.add_argument("--matcher_box", action="store_true", default=False, help="Use bipartite matching from matcher to get a bounding box on the target image. Requires n_shot > 0")
         parser.add_argument("--run_n", type=int, default=0)
-        parser.add_argument("--random_state_dir", type=str, default="/leonardo_work/IscrC_MARSv2/SAM3_FSVOS/src/minivspw_random_state/VSPW/SAM3_GEN_LABEL_SUPPORT/${6}-SHOT")
+        parser.add_argument("--random_state_dir", type=str, default="/megaverse/storage/samele/FSS-SAM3/src/minivspw_random_state/VSPW/")
         # Random state management
         parser.add_argument('--seed', type=int, default=0)
 
         # Loggin arguments
-        parser.add_argument('--log_dir', type=str, default='/leonardo_work/IscrC_MARSv2/SAM3_FSVOS/JOB_OUTPUT/logs')
+        parser.add_argument('--log_dir', type=str, default='/megaverse/storage/samele/FSS-SAM3/experiment_results_logs')
         return parser.parse_args()
 
 def save_image_with_box(image, box, output_path):
@@ -307,112 +307,115 @@ def main():
 
     print("STARTING SEGMENTATION")
     print("-" * 50)
-    for idx, data in enumerate(loader):
-        # Deterministic seed for every episode
-        current_seed = args.seed + (args.run_n * 10000) + idx
-        random.seed(current_seed)
-        np.random.seed(current_seed)
-        torch.manual_seed(current_seed)
-        
-        query_imgs = data['query_imgs']
-        query_masks = data['query_masks']
-        support_imgs = data['support_imgs']
-        support_masks = data['support_masks']
-        class_id = data['class_id']
-        class_name = data['class_name']
-        dir_name = data['dir_name']
-        chosen_frames = data['chosen_frames']
+    with torch.no_grad():
+        for idx in range(len(loader)):
+            # Deterministic seed set BEFORE data loading so support image sampling
+            # (np.random.choice inside load_frame) is identical across all experiments.
+            current_seed = args.seed + (args.run_n * 10000) + idx
+            random.seed(current_seed)
+            np.random.seed(current_seed)
+            torch.manual_seed(current_seed)
+            data = loader[idx]
 
-        print(f"query_imgs shape: {query_imgs.shape}")
-        print(f"query_masks shape: {query_masks.shape}")
+            query_imgs = data['query_imgs']
+            query_masks = data['query_masks']
+            support_imgs = data['support_imgs']
+            support_masks = data['support_masks']
+            class_id = data['class_id']
+            class_name = data['class_name']
+            dir_name = data['dir_name']
+            chosen_frames = data['chosen_frames']
 
-        if support_imgs is not None and support_masks is not None and len(support_imgs) > 0:
-            print(f"support_imgs shape: {support_imgs.shape}")
-            print(f"support_masks shape: {support_masks.shape}")
+            # print(f"query_imgs shape: {query_imgs.shape}")
+            # print(f"query_masks shape: {query_masks.shape}")
 
-        # assert len(query_imgs) == len(query_masks)
-        assert query_imgs.shape[0] == query_masks.shape[0]
+            # if support_imgs is not None and support_masks is not None and len(support_imgs) > 0:
+                # print(f"support_imgs shape: {support_imgs.shape}")
+                # print(f"support_masks shape: {support_masks.shape}")
 
-        # class_name = dataset.idx_to_classname[class_id]
-        print(f"Segmenting image {dir_name} on class '{class_name}' with id {class_id}")
-        
-        # Determine lemma entries for this image
-        if args.all_lemmas:
-            lemma_entries = class_id_to_virtual[class_id]
-        else:
-            lemma_entries = [(class_id, class_name)]
+            # assert len(query_imgs) == len(query_masks)
+            assert query_imgs.shape[0] == query_masks.shape[0]
 
-        for eval_id, lemma in lemma_entries:
+            # class_name = dataset.idx_to_classname[class_id]
+            print(f"Segmenting image {dir_name} on class '{class_name}' with id {class_id}")
+            
+            # Determine lemma entries for this image
             if args.all_lemmas:
-                print(f"  Prompting with lemma: '{lemma}' (eval_id: {eval_id})")
+                lemma_entries = class_id_to_virtual[class_id]
+            else:
+                lemma_entries = [(class_id, class_name)]
 
-            vid_output_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "output")
-            vid_ground_truth_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "ground_truth")
-            vid_frames_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "frames")
-            if args.matcher_box:
-                vid_box_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "bounding_box")
+            for eval_id, lemma in lemma_entries:
+                if args.all_lemmas:
+                    print(f"  Prompting with lemma: '{lemma}' (eval_id: {eval_id})")
 
-            os.makedirs(vid_output_dir, exist_ok=True)
-            os.makedirs(vid_ground_truth_dir, exist_ok=True)
-            os.makedirs(vid_frames_dir, exist_ok=True)
-            if args.matcher_box:
-                os.makedirs(vid_box_dir, exist_ok=True)
-
-            predictions = []
-            ground_truths = []
-
-            for frame_idx in range(len(query_imgs)):
-                print(f"Processing frame {chosen_frames[frame_idx]}")
-
-                # img_pil = Image.fromarray((query_imgs[frame_idx] * 255).astype(np.uint8))
-                query_frame = query_imgs[frame_idx]
-                img_numpy = (query_frame * 255).permute(1, 2, 0).to(torch.uint8).cpu().numpy()
-                ground_truth = query_masks[frame_idx].squeeze()
-                print(f"query_frame shape: {query_frame.shape}")
-                print(f"ground_truth shape: {ground_truth.shape}")
-                
-                box = None
+                vid_output_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "output")
+                vid_ground_truth_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "ground_truth")
+                vid_frames_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "frames")
                 if args.matcher_box:
-                    box, points = matcher_box_calculator.compute_box(
-                        reference_image=support_imgs, 
-                        target_image=query_frame, 
-                        reference_mask=support_masks
-                    )
-                    for i in range(support_imgs.shape[0]):
-                        save_mask_overlay(Image.fromarray((support_imgs[i]*255).permute(1,2,0).to(torch.uint8).cpu().numpy()), support_masks[i], os.path.join(vid_box_dir, f"support_{i}.png"))
-                    box = matcher_box_calculator.convert_box_to_input_resolution(box=box, output_resolution=518)
-                    save_image_with_box(image=img_numpy, box=box, output_path=os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}.png"))
-                    save_image_with_points(image=img_numpy, points=points, output_path=os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}_points.png"))
-                    sam3_box = convert_box_to_sam3_format(box=box, image_size=518)
-                    # sam3_points = convert_points_to_sam3_format(points=points, image_size=518)
-                    box_coordinates.append(sam3_box)
-                    # print(f"Box: {box}")
-                    # print(f"SAM3 Box: {sam3_box}")
+                    vid_box_dir = os.path.join(args.output_dir, f"{dir_name}_{eval_id}_{idx}", "bounding_box")
 
+                os.makedirs(vid_output_dir, exist_ok=True)
+                os.makedirs(vid_ground_truth_dir, exist_ok=True)
+                os.makedirs(vid_frames_dir, exist_ok=True)
                 if args.matcher_box:
-                    prediction = sam3.prompt_text_with_box(image=query_frame, text_prompt=lemma, box=sam3_box)
-                    # prediction = sam3.prompt_text_with_points(image=query_frame, text_prompt=lemma, points=sam3_points)
-                else:
-                    prediction = sam3.prompt_text(image=query_frame, text_prompt=lemma)
-                img_pil = Image.fromarray(img_numpy)
-                save_image(img_pil, os.path.join(vid_frames_dir, f"frame_{chosen_frames[frame_idx]}_input.png"))
-                save_image(prediction, os.path.join(vid_output_dir, f"frame_{chosen_frames[frame_idx]}.png"))
-                save_image(ground_truth, os.path.join(vid_ground_truth_dir, f"frame_{chosen_frames[frame_idx]}.png"))
+                    os.makedirs(vid_box_dir, exist_ok=True)
 
-                save_mask_overlay(img_pil, prediction, os.path.join(vid_output_dir, f"frame_{chosen_frames[frame_idx]}_overlay.png"))
-                save_mask_overlay(img_pil, ground_truth, os.path.join(vid_ground_truth_dir, f"frame_{chosen_frames[frame_idx]}_overlay.png"))
+                predictions = []
+                ground_truths = []
 
-                predictions.append(prediction)
-                ground_truths.append(ground_truth)
+                for frame_idx in range(len(query_imgs)):
+                    print(f"Processing frame {chosen_frames[frame_idx]}")
 
-            evaluator.update_evl(eval_id, ground_truths, predictions, sample_id=f"{dir_name}_{eval_id}_{idx}")
-            print(f"Updated evaluation metrics for '{lemma}'")
+                    # img_pil = Image.fromarray((query_imgs[frame_idx] * 255).astype(np.uint8))
+                    query_frame = query_imgs[frame_idx]
+                    img_numpy = (query_frame * 255).permute(1, 2, 0).to(torch.uint8).cpu().numpy()
+                    ground_truth = query_masks[frame_idx].squeeze()
+                    # print(f"query_frame shape: {query_frame.shape}")
+                    # print(f"ground_truth shape: {ground_truth.shape}")
+                    
+                    box = None
+                    if args.matcher_box:
+                        box, points = matcher_box_calculator.compute_box(
+                            reference_image=support_imgs, 
+                            target_image=query_frame, 
+                            reference_mask=support_masks
+                        )
+                        for i in range(support_imgs.shape[0]):
+                            save_mask_overlay(Image.fromarray((support_imgs[i]*255).permute(1,2,0).to(torch.uint8).cpu().numpy()), support_masks[i], os.path.join(vid_box_dir, f"support_{i}.png"))
+                        box = matcher_box_calculator.convert_box_to_input_resolution(box=box, output_resolution=518)
+                        save_image_with_box(image=img_numpy, box=box, output_path=os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}.png"))
+                        save_image_with_points(image=img_numpy, points=points, output_path=os.path.join(vid_box_dir, f"frame_{chosen_frames[frame_idx]}_points.png"))
+                        sam3_box = convert_box_to_sam3_format(box=box, image_size=518)
+                        # sam3_points = convert_points_to_sam3_format(points=points, image_size=518)
+                        box_coordinates.append(sam3_box)
+                        # print(f"Box: {box}")
+                        # print(f"SAM3 Box: {sam3_box}")
 
-        if (idx + 1) % 10 == 0:
-            current_time = time.perf_counter()
-            elapsed_so_far = current_time - start_time
-            avg_time_per_img = elapsed_so_far / (idx + 1)
-            print(f">>> Processate {idx + 1} immagini in {elapsed_so_far:.2f} sec (Media: {avg_time_per_img:.2f} sec/img)")
+                    if args.matcher_box:
+                        prediction = sam3.prompt_text_with_box(image=query_frame, text_prompt=lemma, box=sam3_box)
+                        # prediction = sam3.prompt_text_with_points(image=query_frame, text_prompt=lemma, points=sam3_points)
+                    else:
+                        prediction = sam3.prompt_text(image=query_frame, text_prompt=lemma)
+                    img_pil = Image.fromarray(img_numpy)
+                    save_image(img_pil, os.path.join(vid_frames_dir, f"frame_{chosen_frames[frame_idx]}_input.png"))
+                    save_image(prediction, os.path.join(vid_output_dir, f"frame_{chosen_frames[frame_idx]}.png"))
+                    save_image(ground_truth, os.path.join(vid_ground_truth_dir, f"frame_{chosen_frames[frame_idx]}.png"))
+
+                    save_mask_overlay(img_pil, prediction, os.path.join(vid_output_dir, f"frame_{chosen_frames[frame_idx]}_overlay.png"))
+                    save_mask_overlay(img_pil, ground_truth, os.path.join(vid_ground_truth_dir, f"frame_{chosen_frames[frame_idx]}_overlay.png"))
+
+                    predictions.append(prediction)
+                    ground_truths.append(ground_truth)
+
+                evaluator.update_evl(eval_id, ground_truths, predictions, sample_id=f"{dir_name}_{eval_id}_{idx}")
+                print(f"Updated evaluation metrics for '{lemma}'")
+
+            if (idx + 1) % 10 == 0:
+                current_time = time.perf_counter()
+                elapsed_so_far = current_time - start_time
+                avg_time_per_img = elapsed_so_far / (idx + 1)
+                print(f">>> Processate {idx + 1} immagini in {elapsed_so_far:.2f} sec (Media: {avg_time_per_img:.2f} sec/img)")
 
     print("-" * 50)
 

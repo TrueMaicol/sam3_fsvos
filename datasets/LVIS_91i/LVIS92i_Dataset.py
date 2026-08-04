@@ -56,6 +56,7 @@ class LVIS92i_Dataset(Dataset):
         # Build idx_to_classname (0-N mapping)
         self.idx_to_classname = {}
         self.class_idx_to_all_lemmas = {}
+        self.idx_to_ground_truth_label = {}
         
         if self.use_synset_names and synset_mapping_csv_path:
             synset_mapping = pd.read_csv(synset_mapping_csv_path, sep="|")
@@ -71,6 +72,7 @@ class LVIS92i_Dataset(Dataset):
                         self.class_idx_to_all_lemmas[idx] = [l.replace("_", " ") for l in str(lemmas_str).split(",")]
                 else:
                     self.idx_to_classname[idx] = self.lvis_api.load_cats([ori_id])[0]['name'] if self.lvis_api else f"cat_{ori_id}"
+                self.idx_to_ground_truth_label[idx] = self.lvis_api.load_cats([ori_id])[0]['name'] if self.lvis_api else f"cat_{ori_id}"
         else:
             for idx, ori_id in enumerate(self.class_ids_ori):
                 self.idx_to_classname[idx] = self.lvis_api.load_cats([ori_id])[0]['name'] if self.lvis_api else f"cat_{ori_id}"
@@ -89,7 +91,11 @@ class LVIS92i_Dataset(Dataset):
 
         if self.transform is not None:
             query_img, query_mask = self.transform([query_img], [query_mask])
-            support_imgs, support_masks = self.transform(support_imgs, support_masks)
+            if self.shot > 0:
+                support_imgs, support_masks = self.transform(support_imgs, support_masks)
+            else:
+                support_imgs = torch.tensor([])
+                support_masks = torch.tensor([])
             
         return query_img, query_mask, support_imgs, support_masks, int(class_idx), query_name
 

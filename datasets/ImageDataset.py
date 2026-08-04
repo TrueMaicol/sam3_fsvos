@@ -12,6 +12,7 @@ import os
 
 from .YoutubeFSVOS.transform import TestTransform
 
+import torch
 from torch.utils.data import Dataset
 
 class ImageDataset(Dataset):
@@ -158,8 +159,11 @@ class ImageDataset(Dataset):
                 self.support_masks = new_support_masks
 
         elif self.benchmark in ['coco', 'lvis', 'ade20k', 'pascal']:
-            self.support_imgs = None
-            self.support_masks = None
+            # These are single-image (no few-shot episode) datasets. Support is empty.
+            # We use empty tensors rather than None so that cross_image_prediction's
+            # None-guards do not trip — the self_attn text_only path never reads them.
+            self.support_imgs = torch.tensor([])
+            self.support_masks = torch.tensor([])
             query_img, query_mask, class_id, dir_name = self.dataset[idx]
             chosen_frames = [0]
             begin_new = None

@@ -94,7 +94,7 @@ networkx==3.5
 nltk==3.9.2
 notebook==7.5.0
 notebook_shim==0.2.4
-numpy==1.26.0
+numpy==1.26.4
 opencv-python==4.11.0.86
 packaging==25.0
 pandas==3.0.0
@@ -147,7 +147,7 @@ six==1.17.0
 sortedcontainers==2.4.0
 soupsieve==2.8
 stack-data==0.6.3
-sympy==1.14.0
+sympy==1.13.1
 tempora==5.8.1
 terminado==0.18.1
 threadpoolctl==3.6.0

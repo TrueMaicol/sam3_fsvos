@@ -14,7 +14,7 @@ Support images + masks
     ▼
 encode_support_visual_tokens()          # random points sampled from GT masks → SAM3 point encoder
     │ aggregated_visual_prompt [seq, 1, 256]
-    │ + text tokens (if --disable_text is off)
+    │ + text tokens (real class label, or "visual" sentinel if --disable_text_inference)
     ▼
 Fusion Encoder (TransformerEncoderFusion, 6 layers)
     Q = image patches of query image [5184, 256]
@@ -59,7 +59,7 @@ The key design levers are:
 | `--synset_mapping_folder_path` | str | `.../synset_mappings` | Path to the synset mapping JSON files |
 | `--use_grouping_ade20k` | bool | False | Group ADE20K classes using a JSON mapping (ADE20K only) |
 | `--all_lemmas` | bool | False | Iterate over all WordNet lemmas for a class, instead of just the canonical one |
-| `--disable_text` | bool | False | Replace the class label with the dummy token `"visual"` — effectively disables text conditioning |
+| `--disable_text_inference` | bool | False | Replace the real class label with the `"visual"` sentinel token **at inference time only**. SAM3 still receives a text token (`"visual"`) but no custom class label. To suppress the class label in the sampling pass too, combine with `--sampling_inputs support_only` (Exp 5 and 7 only) — see [Suppressing the class label in both passes](#suppressing-the-class-label-in-both-passes) |
 
 ### Point Prompt Controls
 
@@ -68,6 +68,7 @@ The key design levers are:
 | `--num_points_from_mask` | int | 20 | Number of points to sample / select as geometric prompts for the decoder |
 | `--skip_coords` | bool | False | Skip spatial coordinate embeddings when encoding point prompts. When False, the exemplar encoder receives both appearance and position information; when True, position is dropped |
 | `--use_query_as_support` | bool | False | Use the query image itself as the support image (1-shot self-support). Incompatible with `--experiment_mode matcher` and `--experiment_mode self_matching` |
+| `--sample_points_from_image` | bool | False | When `--experiment_mode random` and `--support_prompt_type points`: sample the point prompts **uniformly from the entire image canvas** instead of only from the foreground mask region. Applies to Exp 1 (random points over the full support image) and Exp 2 (random points over the full query image, via `--use_query_as_support`). Has no effect when `--support_prompt_type box`. |
 
 ### Support Prompt Type
 
@@ -158,17 +159,28 @@ The pooled-text bias is the projected mean-pooled text embedding (`text_pooling_
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--sampling_inputs` | str | `both` | Controls what goes into the Fusion Encoder during the **point-selection forward pass** (the dedicated pass that extracts the attention map used for point selection). Only relevant for `--experiment_mode attn_prior` and `self_attn`. The final SAM3 inference pass is always run with text + support visual tokens |
+| `--sampling_inputs` | str | `both` | Controls what goes into the Fusion Encoder during the **point-selection forward pass** (the dedicated pass that extracts the attention map used for point selection). Only relevant for `--experiment_mode attn_prior` and `self_attn`. `support_only` also applies to `matcher`: it replaces the class label with the `"visual"` sentinel in the fusion feature extraction pass. The final SAM3 inference pass is always run with text + support visual tokens |
 
 **`--sampling_inputs` choices:**
 
 | Value | Description |
 |-------|-------------|
-| `both` | Text label + support visual prompt tokens (default — same as inference pass) |
-| `text_only` | Text label only; no support visual tokens in the sampling pass |
-| `support_only` | Support visual prompt tokens only; text tokens are excluded from the cross-attention prompt |
+| `both` | Text label + support visual prompt tokens (default — same as inference pass). For `matcher`: class label is used in the fusion feature extraction pass |
+| `text_only` | Text label only; no support visual tokens in the sampling pass. Only valid for `attn_prior`/`self_attn` |
+| `support_only` | Support visual tokens + `"visual"` sentinel token (class label suppressed). For `attn_prior`/`self_attn`: also excludes class label from the fusion sampling pass. For `matcher`: replaces the class label with `"visual"` in the fusion feature extraction pass (`--use_fused_matcher_features` only) |
 
 This flag is an ablation tool to isolate which input signal is responsible for the attention map's localization quality. Requires `--nshot > 0` when using `support_only`.
+
+#### Suppressing the class label in both passes
+
+To run a fully class-label-free experiment on Exp 5/7 — where SAM3 uses only the `"visual"` sentinel (no custom text label) in **both** the sampling pass and the inference pass — combine both flags:
+
+```
+--sampling_inputs support_only   # sampling pass: "visual" sentinel + support visual tokens
+--disable_text_inference          # inference pass: "visual" sentinel + aggregated visual prompt
+```
+
+The `"visual"` token is always present (SAM3 requires a text input for architectural reasons), but no custom class label is used anywhere in the pipeline.
 
 ### Attention Map Saves (always produced for every experiment)
 
@@ -220,7 +232,9 @@ Enforced by `validate_args()` at startup — invalid combinations raise an excep
 | `--experiment_mode self_matching` is incompatible with `--use_query_as_support` |
 | `--experiment_mode dense_cross_attn` requires `--nshot > 0` |
 | `--experiment_mode self_attn --sampling_inputs support_only` requires `--nshot > 0` |
-| `--sampling_inputs text_only\|support_only` only applies to `--experiment_mode attn_prior` or `self_attn` |
+| `--experiment_mode attn_prior --sampling_inputs support_only` requires `--nshot > 0` |
+| `--sampling_inputs text_only` only applies to `--experiment_mode attn_prior` or `self_attn` |
+| `--sampling_inputs support_only` applies to `--experiment_mode attn_prior`, `self_attn`, or `matcher` |
 | `--support_prompt_type box` is incompatible with `--sampling_inputs text_only` |
 | `--support_prompt_type box` only applies to `--experiment_mode attn_prior`, `self_attn`, or `random` |
 
@@ -235,15 +249,19 @@ Enforced by `validate_args()` at startup — invalid combinations raise an excep
 --experiment_mode random
 --nshot N
 [--support_prompt_type points|box]
-[--disable_text]
+[--disable_text_inference]
 [--skip_coords]
+[--sample_points_from_image]
 ```
 
 **Flow:**
 ```
 For each support image:
     if --support_prompt_type points (default):
-        sample --num_points_from_mask random points from GT mask
+        if --sample_points_from_image:
+            sample --num_points_from_mask random points from the full support image (uniform over all pixels)
+        else:
+            sample --num_points_from_mask random points from GT mask (default)
         encode points via SAM3 geometry encoder → 1 token per point
     if --support_prompt_type box:
         run connected-components on GT mask → select largest blob
@@ -251,28 +269,48 @@ For each support image:
         encode box via SAM3 geometry encoder (ROI-align) → 1 token per support image
         (--skip_coords: use ROI-align content only, drop coordinate embeddings)
 Aggregate all support tokens → visual prompt
-Combine with text label tokens (unless --disable_text)
+Combine with text label tokens (or "visual" sentinel if --disable_text_inference)
     → final prompt fed to Fusion Encoder on query image
 Fusion Encoder: query patches cross-attend to final prompt
 SAM3 decoder → mask
 ```
 
-**Notes:** The visual prompt encodes *where* and *what* is in the support. `--skip_coords` tests whether removing spatial information hurts (it typically does, because the exemplar encoder partially encodes object appearance via position). With `--support_prompt_type box`, a single ROI-pooled token represents the whole object region, collapsing N scattered point tokens into one holistic representation.
+**Notes:** The visual prompt encodes *where* and *what* is in the support. `--skip_coords` tests whether removing spatial information hurts (it typically does, because the exemplar encoder partially encodes object appearance via position). With `--support_prompt_type box`, a single ROI-pooled token represents the whole object region, collapsing N scattered point tokens into one holistic representation. `--sample_points_from_image` replaces the foreground-constrained sampling with uniform image-wide sampling — useful only as an ablation for Exp 1 (what if we give random positions on the support image?) and as the main variant for Exp 2 (see below).
 
 ---
 
 ### Experiment 2 — Self-support (query image as its own support)
+
+Two variants depending on where the point prompts are sampled from.
+
+#### Variant A — GT-mask points (canonical upper bound)
 
 **Flags:**
 ```
 --experiment_mode random
 --nshot 1
 --use_query_as_support
-[--disable_text]
+[--disable_text_inference]
 [--skip_coords]
 ```
 
 **Flow:** Identical to Experiment 1, but the support image is replaced by the query image itself. The GT mask of the query is used to sample the support points. This tests what the model can do when it "sees" the answer — an upper-bound sanity check.
+
+#### Variant B — Fully random image points
+
+**Flags:**
+```
+--experiment_mode random
+--nshot 1
+--use_query_as_support
+--sample_points_from_image
+[--disable_text_inference]
+[--skip_coords]
+```
+
+**Flow:** Same substitution as Variant A (query image replaces the support), but the point prompts are sampled **uniformly from the entire query image canvas** — no foreground mask constraint. The model receives `--num_points_from_mask` random point hints with no localization bias, plus the text label. Variant B tests a purely text-guided prompt regime, measuring what information the geometric encoder can contribute from randomly placed, semantically uninformed points.
+
+**Implementation note:** `--sample_points_from_image` replaces the foreground mask with an all-ones mask before calling `get_random_points_from_mask`, so `np.where` returns all pixel positions and `np.random.choice` samples from the full image. The selected pixel coordinates are relative to the transformed image resolution (1008 × 1008).
 
 ---
 
@@ -283,7 +321,7 @@ SAM3 decoder → mask
 --experiment_mode matcher
 --nshot N
 [--sampling random|top-k|...]
-[--disable_text]
+[--disable_text_inference]
 [--skip_coords]
 ```
 
@@ -314,11 +352,15 @@ Combine with text tokens → Fusion Encoder on query → mask
 --nshot N
 --use_fused_matcher_features
 [--sampling random|top-k|...]
-[--disable_text]
+[--sampling_inputs support_only]
+[--disable_text_inference]
 [--skip_coords]
 ```
 
 **Flow:** Same as 3a, but both feature volumes are obtained from the Fusion Encoder output (after cross-attention with text tokens). Text conditioning makes features more semantically aligned with the class label before matching.
+
+> [!NOTE]
+> `--sampling_inputs support_only` replaces the class label with the `"visual"` sentinel in the **fusion feature extraction pass** (both support and query feature volumes computed by `compute_box`). Combined with `--disable_text_inference`, neither the matching features nor the final inference uses the real class label. For Exp 3a (backbone features), `--sampling_inputs support_only` has no effect since backbone features are text-agnostic.
 
 ---
 
@@ -397,7 +439,7 @@ All weights are **pre-softmax** raw scaled dot-products (`Q·Kᵀ / √d`), cons
 Resolve sampling-pass inputs from --sampling_inputs
     both:         use text label + support visual tokens
     text_only:    use text label only (no visual_prompt)
-    support_only: use support visual tokens only (no text in cross-attention)
+    support_only: use support visual tokens + "visual" sentinel (class label suppressed; SAM3 still receives its required text token)
 Run Fusion Encoder on query — capture cross-attn weights (aggregated via --attention_aggregate_function)
 Construct attention map [5184] from target layers
 Sample patches based on --attn_sampling_mode (top-k or bottom-k, k=--num_points_from_mask) → patch indices → pixel centers → normalized coords
@@ -496,7 +538,7 @@ All weights are **pre-softmax** raw scaled dot-products averaged over heads. Thi
 Resolve sampling-pass inputs:
     --sampling_inputs both:         run Fusion Encoder with text label + support visual tokens
     --sampling_inputs text_only:    run Fusion Encoder with text label only (no visual_prompt)
-    --sampling_inputs support_only: run Fusion Encoder with support visual tokens only
+    --sampling_inputs support_only: run Fusion Encoder with support visual tokens + "visual" sentinel (class label suppressed)
 
     Support visual tokens built from (when sampling_inputs is both or support_only):
         --support_prompt_type points (default): random points from GT mask
@@ -518,7 +560,7 @@ Does NOT use the bipartite matcher or the cross-attention map. `--sampling` is n
 **`--sampling_inputs` ablation purpose:**
 - `both` (default): replicates the full prompt context used in inference; tests whether the self-attention map is driven by the combined signal
 - `text_only`: isolates the contribution of the text label to the self-attention localization (incompatible with `--support_prompt_type box`)
-- `support_only`: isolates the contribution of the support visual tokens
+- `support_only`: isolates the contribution of the support visual tokens; uses `"visual"` as the text sentinel (no class label) — SAM3 still receives the text token, just not the actual class name
 
 **`--support_prompt_type box` ablation purpose:**
 Tests whether a holistic ROI-pooled box token (capturing the whole object region) produces a more focused self-attention prior than a set of scattered point tokens.
@@ -592,6 +634,7 @@ Both use `return_pre_softmax=True, average_attn_weights=True` internally — raw
 --experiment_mode random
     --support_prompt_type         points (default) or box
     --blob_selection              largest (default) or smallest; only meaningful with support_prompt_type=box
+    --sample_points_from_image    when support_prompt_type=points: sample from the full image canvas instead of GT mask
 
 --sampling_inputs                 applies only to --experiment_mode attn_prior or self_attn
 --attn_layers                     affects point selection for Exp 5/6/7 and attention map saving for all experiments
@@ -607,9 +650,11 @@ Both use `return_pre_softmax=True, average_attn_weights=True` internally — raw
 | Experiment | Key flags |
 |-----------|-----------|
 | 1 — random support | `--experiment_mode random --nshot N` |
-| 2 — self-support | `--experiment_mode random --nshot 1 --use_query_as_support` |
+| 2a — self-support (GT-mask points) | `--experiment_mode random --nshot 1 --use_query_as_support` |
+| 2b — self-support (random image points) | `--experiment_mode random --nshot 1 --use_query_as_support --sample_points_from_image` |
 | 3a — matcher + backbone | `--experiment_mode matcher --nshot N` |
 | 3b — matcher + fusion features | `--experiment_mode matcher --nshot N --use_fused_matcher_features` |
+| 3b-no-label — matcher + fusion features + no class label | `--experiment_mode matcher --nshot N --use_fused_matcher_features --sampling_inputs support_only --disable_text_inference` |
 | 3c — matcher + structured sampling | `--experiment_mode matcher --nshot N [--use_fused_matcher_features] --sampling k-medoids-points` |
 | 4 — query self-matching (failed) | `--experiment_mode self_matching --nshot N` |
 | 5a — attention prior topk | `--experiment_mode attn_prior --nshot N --attn_sampling_mode top-k --attn_layers last` |
@@ -626,6 +671,9 @@ Both use `return_pre_softmax=True, average_attn_weights=True` internally — raw
 | 7a — self-attn bottom-k (both) | `--experiment_mode self_attn --nshot N --attn_sampling_mode bottom-k --attn_layers last` |
 | 7b — self-attn bottom-k, text only | `--experiment_mode self_attn --nshot N --sampling_inputs text_only --attn_layers last` |
 | 7c — self-attn bottom-k, support only | `--experiment_mode self_attn --nshot N --sampling_inputs support_only --attn_layers last` |
+| 7c-no-label — self-attn, no class label in both passes | `--experiment_mode self_attn --nshot N --sampling_inputs support_only --disable_text_inference --attn_layers last` |
+| 5c-no-label — attn prior, no class label in both passes | `--experiment_mode attn_prior --nshot N --sampling_inputs support_only --disable_text_inference --attn_layers last` |
+| 1-no-label — random support, no class label at inference | `--experiment_mode random --nshot N --disable_text_inference` |
 | 1-box — random + box support | `--experiment_mode random --nshot N --support_prompt_type box` |
 | 1-box-small — random + smallest blob | `--experiment_mode random --nshot N --support_prompt_type box --blob_selection smallest` |
 | 5-box — attn prior + box support | `--experiment_mode attn_prior --nshot N --attn_sampling_mode top-k --attn_layers last --support_prompt_type box` |

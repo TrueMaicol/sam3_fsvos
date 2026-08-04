@@ -153,7 +153,7 @@ class NMiniVSPWEpisodicData_IMAGE(EpisodicData):
             self.synset_mapping_csv_path = os.path.join(_data_root, "synset_mapping.csv")
         else:
             self.synset_mapping_csv_path = synset_mapping_csv_path
-
+        self.idx_to_ground_truth_label = dict(class_dic)
         self.class_idx_to_all_lemmas = {}
         if self.use_synset_names:
             synset_mapping = pd.read_csv(self.synset_mapping_csv_path, sep="|")

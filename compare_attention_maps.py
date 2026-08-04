@@ -3,11 +3,34 @@ Compare attention maps across experiments for the same samples.
 
 For each benchmark × sampled frame, produces one PNG: rows = experiments, columns = map types.
 Edit the CONFIG section below, then run:  python src/compare_attention_maps.py
+
+Sampling strategy
+-----------------
+The script enumerates candidate sample directories from the FIRST experiment only
+(cheap directory listing, no deep walk).  For each randomly drawn candidate it
+verifies that the corresponding attention_maps directory exists in EVERY other
+experiment before accepting it.  Candidates that are missing from one or more
+experiments are silently skipped and a fresh one is drawn.  This continues until
+the requested N_SAMPLES have been collected (or the pool is exhausted).
+
+ZIP export
+----------
+After plots are produced, the script creates one ZIP per benchmark at:
+  {OUTPUT_DIR}/{benchmark}_samples.zip
+
+The archive mirrors the original folder structure:
+  {benchmark}/{experiment_name}/{relative_sample_path}/...
+
+where {relative_sample_path} is the path relative to the experiment root
+(e.g. fold_1/val2014/COCO_val2014_000000001234.jpg_40_641).
+The ENTIRE contents of each sample directory are included.
 """
 
 import os
 import re
 import random
+import zipfile
+import shutil
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -16,46 +39,76 @@ from pathlib import Path
 
 # Template for experiment output folders.
 # Use {benchmark} and {experiment} as placeholders.
-FOLDER_TEMPLATE = "/leonardo_scratch/large/userexternal/mcavicch/SAM3_OUTPUT_DATA/{benchmark}/{experiment}"
+FOLDER_TEMPLATE = "/megaverse/storage/samele/FSS-SAM3/output/{benchmark}/{experiment}"
 
 BENCHMARKS = [
-    "PASCAL-5i",
+    # "PASCAL-5i",
     "COCO-20i",
-    "VSPW",
-    "YOUTUBE_FSVOS",
-    "LVIS-92i",
+    # "VSPW",
+    # "YOUTUBE_FSVOS",
+    # "LVIS-92i",
 ]
 
 EXPERIMENTS = [
-    "1_SHOT_CROSS_ATTN_5_POINTS_TOP_K_ALL_LAYERS",
-    "1_SHOT_CROSS_ATTN_5_POINTS_TOP_K_LAST_LAYER",
-    "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_ONLY_ALL_LAYERS",
-    "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_ONLY_LAST_LAYER",
-    "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_SUPPORT_ALL_LAYERS",
-    "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_SUPPORT_LAST_LAYER",
-    "1_SHOT_SELF_ATTN_TOPK_5_POINTS_TEXT_ONLY_ALL_LAYERS_AGGR_MAX",
-    "1_SHOT_SELF_ATTN_TOPK_5_POINTS_TEXT_ONLY_LAST_LAYER_AGGR_MAX",
-    "1_SHOT_SELF_ATTN_TOPK_5_POINTS_TEXT_SUPPORT_ALL_LAYERS_AGGR_MAX",
-    "1_SHOT_SELF_ATTN_TOPK_5_POINTS_TEXT_SUPPORT_LAST_LAYER_AGGR_MAX",
-    "1_SHOT_MATCHER_5_POINTS_FUSED_K_MEDOIDS_POINTS",
-    "1_SHOT_5_POINTS_QUERY_AS_SUPPORT",
+    "QUERY_AS_SUPPORT_ALL_LAYERS_FOR_MAPS",
+    "EXP7_TEXT_ONLY_ALL_LAYERS_FOR_MAPS",
+    # "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_ONLY_ALL_LAYERS",
+    # "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_BOX_ALL_LAYERS_NO_POS_BIAS",
+    # "EXP7_BOX_ALL_SAMP_QIMG_SPROMPT_NO_POS_BIAS",
+    # "EXP5_ATTN_PRIOR_TOPK_ALL_LAYERS_NO_POS_BIAS",
+    # "EXP5_SAMPL_TEXT_TOP_K_ALL_LAYERS_AGGR_MAX",
+    # "EXP5_SAMPL_SUPPORT_TOP_K_ALL_LAYERS_NO_POS_BIAS_AGGR_MAX",
+    # "1_SHOT_CROSS_ATTN_5_POINTS_TOP_K_ALL_LAYERS",
+    # "1_SHOT_CROSS_ATTN_5_POINTS_TOP_K_LAST_LAYER",
+    # "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_ONLY_ALL_LAYERS",
+    # "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_ONLY_LAST_LAYER",
+    # "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_SUPPORT_ALL_LAYERS",
+    # "1_SHOT_SELF_ATTN_BOTTOMK_5_POINTS_TEXT_SUPPORT_LAST_LAYER",
+    # "1_SHOT_SELF_ATTN_TOPK_5_POINTS_TEXT_ONLY_ALL_LAYERS_AGGR_MAX",
+    # "1_SHOT_SELF_ATTN_TOPK_5_POINTS_TEXT_ONLY_LAST_LAYER_AGGR_MAX",
+    # "1_SHOT_SELF_ATTN_TOPK_5_POINTS_TEXT_SUPPORT_ALL_LAYERS_AGGR_MAX",
+    # "1_SHOT_SELF_ATTN_TOPK_5_POINTS_TEXT_SUPPORT_LAST_LAYER_AGGR_MAX",
+    # "1_SHOT_MATCHER_5_POINTS_FUSED_K_MEDOIDS_POINTS",
+    # "1_SHOT_5_POINTS_QUERY_AS_SUPPORT",
     # add more experiment folder names here
 ]
 
 EXPERIMENT_NAMES = [
-    "CROSS-ATTN TOP-K TEXT+SUPPORT ALL LAYERS",
-    "CROSS-ATTN TOP-K TEXT+SUPPORT LAST LAYERS",
-    "SELF-ATTN BOTTOM-K TEXT ONLY ALL LAYERS",
-    "SELF-ATTN BOTTOM-K TEXT ONLY LAST LAYERS",
-    "SELF-ATTN BOTTOM-K TEXT+SUPPORT ALL LAYERS",
-    "SELF-ATTN BOTTOM-K TEXT+SUPPORT LAST LAYERS",
-    "SELF-ATTN TOP-K TEXT ONLY ALL LAYERS AGGR MAX",
-    "SELF-ATTN TOP-K TEXT ONLY LAST LAYERS AGGR MAX",
-    "SELF-ATTN TOP-K TEXT+SUPPORT ALL LAYERS AGGR MAX",
-    "SELF-ATTN TOP-K TEXT+SUPPORT LAST LAYERS AGGR MAX",
-    "MATCHER FUSED K-MEDOIDS",
     "QUERY AS SUPPORT",
+    "ZERO SHOT",
+    # "SELF BOTTOM-K TEXT ALL_L",
+    # "SELF BOTTOM-K TEXT+BOX NO_POS_BIAS ALL_L",
+    # "SELF BOTTOM-K TEXT+BOX ALL_L TEXT_INJECTION SAMPLING QUERY+SUPPORT",
+    # "CROSS TOP-K TEXT+POINTS NO_POS_BIAS ALL_L",
+    # "CROSS TOP-K TEXT ALL_L AGGR_MAX",
+    # "CROSS TOP-K POINTS NO_POS_BIAS ALL_L AGGR_MAX",
+    # "CROSS-ATTN TOP-K TEXT+SUPPORT ALL LAYERS",
+    # "CROSS-ATTN TOP-K TEXT+SUPPORT LAST LAYERS",
+    # "SELF-ATTN BOTTOM-K TEXT ONLY ALL LAYERS",
+    # "SELF-ATTN BOTTOM-K TEXT ONLY LAST LAYERS",
+    # "SELF-ATTN BOTTOM-K TEXT+SUPPORT ALL LAYERS",
+    # "SELF-ATTN BOTTOM-K TEXT+SUPPORT LAST LAYERS",
+    # "SELF-ATTN TOP-K TEXT ONLY ALL LAYERS AGGR MAX",
+    # "SELF-ATTN TOP-K TEXT ONLY LAST LAYERS AGGR MAX",
+    # "SELF-ATTN TOP-K TEXT+SUPPORT ALL LAYERS AGGR MAX",
+    # "SELF-ATTN TOP-K TEXT+SUPPORT LAST LAYERS AGGR MAX",
+    # "MATCHER FUSED K-MEDOIDS",
+    # "QUERY AS SUPPORT",
 ]  # list of labels matching EXPERIMENTS order, or None to use folder names
+
+# Subfolder inside 'attention_maps' to read from for each experiment ("inference", "sampling", or "" for root).
+# Must match EXPERIMENTS length.
+EXPERIMENT_SUBFOLDERS = [
+    # "",  # Example: read from attention_maps/sampling
+    # "",          # Read from root of attention_maps (old behavior)
+    # "",
+    # "",
+    # "sampling",
+    # "sampling",
+    "inference_maps",
+    "sampling_maps",
+    # add corresponding subfolder here for more experiments
+]
 
 # Extra columns prepended to the attention-map columns.
 # Resolved relative to each experiment's sample directory, shown in every row.
@@ -75,10 +128,9 @@ ATTN_MAP_TYPES = [
 
 N_SAMPLES = 10      # number of frames to compare per benchmark; None = all frames
 RANDOM_SEED = 42    # for reproducible sampling
-# Fast mode: discover tags from the first experiment only, then do targeted lookups for the rest.
-# Set to False to revert to full scan + intersection across all experiments (slower but safer).
-SKIP_INTERSECTION_CHECK = True
-OUTPUT_DIR = "/leonardo_work/IscrC_MARSv2/SAM3_FSVOS/attention_maps_comparison"  # one sub-folder per benchmark will be created here
+CACHE_SAMPLED_TAGS = False   # if True, saves chosen frame tags to a .txt file and reloads them on next run
+
+OUTPUT_DIR = "/megaverse/storage/samele/FSS-SAM3/attention_maps_comparison_2"  # one sub-folder per benchmark will be created here
 CELL_SIZE_INCHES = 3.5    # size of each cell (square); reduce if figures are too wide/tall
 
 # Per-layer map layout
@@ -109,8 +161,131 @@ _LAYER_PATTERN = re.compile(
 )
 
 
-def discover_frames(folder: str) -> dict:
-    """Return {sample_key: {map_type: Path}} by walking {folder}/**/attention_maps/.
+# ---------------------------------------------------------------------------
+# Sampling helpers
+# ---------------------------------------------------------------------------
+
+def _list_candidate_tags(folder: str, map_source: str = "") -> list:
+    """
+    Enumerate all *sample-level* directories under *folder* that actually
+    contain an attention_maps directory (optionally with map_source subfolder).
+
+    Returns a list of tag strings in the SAME format as ``discover_frames``:
+        ``<rel_path_to_sample_dir>/<frame_tag_from_filename>``
+    where ``frame_tag_from_filename`` is extracted from an actual file inside
+    attention_maps/ (e.g. ``0`` from ``frame_0_cross_total_all.png``), NOT
+    the directory name (which may differ).
+
+    This is a fast, shallow enumeration — it peeks at one file per sample.
+    """
+    folder_path = Path(folder)
+    print(f"  Scanning for candidate sample dirs in {folder_path}…")
+    if not folder_path.is_dir():
+        return []
+
+    tags = []
+
+    def _peek_frame_tag(attn_dir: Path) -> str | None:
+        """Return the first frame_tag found by scanning filenames in attn_dir."""
+        try:
+            for fname in os.listdir(attn_dir):
+                m = _MAP_PATTERN.match(fname) or _LAYER_PATTERN.match(fname)
+                if m:
+                    return m.group(1)
+        except OSError:
+            pass
+        return None
+
+    def _process_sample_dir(sample_dir: Path):
+        """Check attention_maps exists, peek frame_tag, append tag."""
+        print("      Processing", sample_dir)
+        attn_dir = sample_dir / "attention_maps"
+        if map_source:
+            attn_dir = attn_dir / map_source
+        print("        Checking", attn_dir)
+        if not attn_dir.is_dir():
+            return
+        frame_tag = _peek_frame_tag(attn_dir)
+        if frame_tag is None:
+            return  # empty or unrecognised dir
+        rel = sample_dir.relative_to(folder_path)  # e.g. fold_1/val2014/COCO_...
+        tags.append(str(rel / frame_tag))
+
+    # Walk up to 3 levels: fold_X / [optional_subdir] / sample_id
+    for depth1 in folder_path.iterdir():          # e.g. fold_1
+        print("  Scanning", depth1)
+        if not depth1.is_dir():
+            continue
+        for depth2 in depth1.iterdir():           # e.g. val2014  (or sample directly)
+            print("    Scanning", depth2)
+            if not depth2.is_dir():
+                continue
+            # Check if depth2 itself is a sample (contains attention_maps)
+            if (depth2 / "attention_maps").is_dir():
+                _process_sample_dir(depth2)
+                continue
+            # Otherwise go one level deeper
+            for depth3 in depth2.iterdir():       # e.g. sample_id
+                print("      Scanning", depth3)
+                if not depth3.is_dir():
+                    continue
+                _process_sample_dir(depth3)
+
+    return tags
+
+
+def _tag_exists_in_experiment(tag: str, folder: str, map_source: str = "") -> bool:
+    """
+    Return True if the attention_maps directory for *tag* exists in *folder*.
+
+    tag format (same as discover_frames): ``<rel_to_sample_dir>/<frame_tag>``
+    e.g. ``fold_1/val2014/COCO_val2014_000000000164.jpg_40_641/0``
+
+    The sample directory is therefore ``folder / tag_parent``, i.e. everything
+    except the last component (the frame_tag).
+    """
+    folder_path = Path(folder)
+    key_path = Path(tag)
+    sample_dir = folder_path / key_path.parent  # strip frame_tag → sample dir
+    attn_dir = sample_dir / "attention_maps"
+    if map_source:
+        attn_dir = attn_dir / map_source
+    return attn_dir.is_dir()
+
+
+def _sample_tags(
+    folder: str,
+    exp_source: str,
+    n: int,
+    rng: random.Random,
+) -> list:
+    """
+    Randomly draw *n* tags from the first experiment only — no cross-experiment
+    checks.  Fast: just a shallow directory listing + shuffle.
+
+    Returns the accepted tag list (may be shorter than *n* if the pool is
+    smaller than requested).
+    """
+    print(f"  Building candidate pool from first experiment (lightweight scan)…")
+    candidates = _list_candidate_tags(folder, exp_source)
+    if not candidates:
+        print(f"  WARNING: no candidate sample dirs found in first experiment.")
+        return []
+
+    print(f"  {len(candidates)} candidate samples found.")
+
+    if n is None or n >= len(candidates):
+        return list(candidates)
+
+    return rng.sample(candidates, n)
+
+
+# ---------------------------------------------------------------------------
+# Frame / map loading (unchanged from original)
+# ---------------------------------------------------------------------------
+
+def discover_frames(folder: str, map_source: str = "") -> dict:
+    """Return {sample_key: {map_type: Path}} by walking {folder}/**/attention_maps/[map_source].
 
     Also resolves EXTRA_COLUMNS paths for each sample.
     """
@@ -120,9 +295,15 @@ def discover_frames(folder: str) -> dict:
         print(f"  WARNING: folder not found: {folder}")
         return frames
     for attn_dir, _, fnames in os.walk(folder_path):
-        if Path(attn_dir).name != "attention_maps":
-            continue
-        rel = Path(attn_dir).relative_to(folder_path).parent  # e.g. fold_2/sample_id
+        p_attn_dir = Path(attn_dir)
+        if map_source:
+            if p_attn_dir.name != map_source or p_attn_dir.parent.name != "attention_maps":
+                continue
+            rel = p_attn_dir.relative_to(folder_path).parent.parent  # e.g. fold_2/sample_id
+        else:
+            if p_attn_dir.name != "attention_maps":
+                continue
+            rel = p_attn_dir.relative_to(folder_path).parent  # e.g. fold_2/sample_id
         sample_abs = folder_path / rel
         for fname in fnames:
             m = _MAP_PATTERN.match(fname)
@@ -165,6 +346,51 @@ def _layer_label(col_key: str) -> str:
     parts = col_key.split("_", 2)  # ['layer', '3', 'cross_total']
     return f"{parts[2]} L{parts[1]}"
 
+
+def _load_frames_for_tags(folder: str, tags: list, map_source: str = "") -> dict:
+    """Targeted lookup: scan only the attention_maps dirs for the given tags.
+
+    tag format: ``<rel_path_to_sample_dir>/<frame_tag>``
+    e.g. ``fold_1/val2014/COCO_val2014_000000000164.jpg_40_641/0``
+
+    - ``key_path.name``   → actual frame_tag used in filenames (e.g. ``"0"``)
+    - ``key_path.parent`` → path to sample dir relative to experiment folder
+    """
+    frames: dict = {}
+    folder_path = Path(folder)
+    if not folder_path.is_dir():
+        print(f"  WARNING: folder not found: {folder}")
+        return {tag: {} for tag in tags}
+    for key in tags:
+        key_path = Path(key)
+        frame_tag = key_path.name           # e.g. "0"
+        sample_dir_rel = key_path.parent    # e.g. fold_1/val2014/COCO_val2014...
+        sample_abs = folder_path / sample_dir_rel
+        attn_dir = sample_abs / "attention_maps"
+        if map_source:
+            attn_dir = attn_dir / map_source
+        frames[key] = {}
+        if not attn_dir.is_dir():
+            continue
+        for fname in os.listdir(attn_dir):
+            m = _MAP_PATTERN.match(fname)
+            if m and m.group(1) == frame_tag:
+                map_type = m.group(2) + ("_sampled" if m.group(4) else "")
+                frames[key][map_type] = attn_dir / fname
+                continue
+            m2 = _LAYER_PATTERN.match(fname)
+            if m2 and m2.group(1) == frame_tag:
+                ltype = m2.group(3) if m2.group(3) != "cross" else "cross_total"
+                frames[key][f"layer_{m2.group(2)}_{ltype}"] = attn_dir / fname
+        for col_label, rel_tmpl in EXTRA_COLUMNS:
+            col_path = sample_abs / rel_tmpl.format(frame_tag=frame_tag)
+            frames[key][col_label] = col_path if col_path.is_file() else None
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# Figure generation (unchanged from original)
+# ---------------------------------------------------------------------------
 
 def make_comparison(tag: str, per_exp_frames: list, exp_names: list, output_path: Path):
     """Always saves a flat comparison (aggregated maps).
@@ -332,90 +558,119 @@ def _make_comparison_layered(tag, per_exp_frames, exp_names, output_path):
     plt.close(fig)
 
 
-def _load_frames_for_tags(folder: str, tags: list) -> dict:
-    """Targeted lookup: scan only the attention_maps dirs for the given tags."""
-    frames: dict = {}
-    folder_path = Path(folder)
-    if not folder_path.is_dir():
-        print(f"  WARNING: folder not found: {folder}")
-        return {tag: {} for tag in tags}
-    for key in tags:
-        key_path = Path(key)
-        frame_tag = key_path.name
-        sample_rel = key_path.parent
-        attn_dir = folder_path / sample_rel / "attention_maps"
-        sample_abs = folder_path / sample_rel
-        frames[key] = {}
-        if not attn_dir.is_dir():
-            continue
-        for fname in os.listdir(attn_dir):
-            m = _MAP_PATTERN.match(fname)
-            if m and m.group(1) == frame_tag:
-                map_type = m.group(2) + ("_sampled" if m.group(4) else "")
-                frames[key][map_type] = attn_dir / fname
+# ---------------------------------------------------------------------------
+# ZIP export
+# ---------------------------------------------------------------------------
+
+def _create_samples_zip(
+    benchmark: str,
+    tags: list,
+    folders: list,
+    experiments: list,
+    exp_names: list,
+):
+    """
+    Create a ZIP file at {OUTPUT_DIR}/{benchmark}_samples_comparison.zip.
+
+    Archive structure:
+      {benchmark}/{experiment_name}/{tag_relative_path}/...
+
+    where {tag_relative_path} is the tag itself (e.g. fold_1/val2014/sample_id),
+    and the entire sample directory is included.
+    """
+    zip_path = Path(OUTPUT_DIR) / f"{benchmark}_samples.zip"
+    print(f"\n  Building ZIP: {zip_path}")
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        for folder, exp_name in zip(folders, exp_names):
+            folder_path = Path(folder)
+            if not folder_path.is_dir():
+                print(f"    WARN: experiment folder missing, skipping: {folder}")
                 continue
-            m2 = _LAYER_PATTERN.match(fname)
-            if m2 and m2.group(1) == frame_tag:
-                ltype = m2.group(3) if m2.group(3) != "cross" else "cross_total"
-                frames[key][f"layer_{m2.group(2)}_{ltype}"] = attn_dir / fname
-        for col_label, rel_tmpl in EXTRA_COLUMNS:
-            col_path = sample_abs / rel_tmpl.format(frame_tag=frame_tag)
-            frames[key][col_label] = col_path if col_path.is_file() else None
-        # matcher_path = sample_abs / "bounding_box" / f"frame_{frame_tag}_matcher_points.png"
-        # frames[key]["MATCHER_POINTS"] = matcher_path if matcher_path.is_file() else None
-    return frames
+
+            for tag in tags:
+                # tag = sample_dir_rel / frame_tag (e.g. fold_1/val2014/COCO_.../0)
+                # The actual sample directory is the parent of the frame_tag component.
+                tag_path = Path(tag)
+                sample_dir_rel = tag_path.parent  # e.g. fold_1/val2014/COCO_val2014_...
+                sample_dir = folder_path / sample_dir_rel
+                if not sample_dir.is_dir():
+                    print(f"    WARN: sample dir missing for tag '{tag}' in '{exp_name}', skipping.")
+                    continue
+
+                # Archive prefix: benchmark / exp_name / sample_dir_rel
+                # e.g. COCO-20i/EXP_NAME/fold_1/val2014/COCO_val2014_...
+                archive_prefix = str(Path(benchmark) / exp_name / sample_dir_rel)
+
+                # Walk the entire sample directory
+                for root, dirs, files in os.walk(sample_dir):
+                    root_path = Path(root)
+                    rel_root = root_path.relative_to(sample_dir)
+                    for fname in files:
+                        src_file = root_path / fname
+                        arcname = str(Path(archive_prefix) / rel_root / fname)
+                        zf.write(src_file, arcname)
+
+    print(f"  ZIP saved: {zip_path}  ({zip_path.stat().st_size / 1024 / 1024:.1f} MB)")
 
 
-def run_benchmark(benchmark: str, exp_names: list):
+# ---------------------------------------------------------------------------
+# Main benchmark runner
+# ---------------------------------------------------------------------------
+
+def run_benchmark(benchmark: str, exp_names: list, exp_sources: list):
     folders = [FOLDER_TEMPLATE.format(benchmark=benchmark, experiment=exp) for exp in EXPERIMENTS]
 
     rng = random.Random(RANDOM_SEED)
+    output_dir = Path(OUTPUT_DIR) / benchmark
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = Path(OUTPUT_DIR) / f"cached_tags_{benchmark}.txt"
 
-    if SKIP_INTERSECTION_CHECK:
-        print(f"\n[{benchmark}] Scanning {exp_names[0]} to discover tags...")
-        first_frames = discover_frames(folders[0])
-        if not first_frames:
-            print(f"  WARNING: no frames found in first experiment, skipping.")
-            return
-        print(f"  {len(first_frames)} frame tags found.")
-        tags = sorted(first_frames.keys())
-        if N_SAMPLES is not None and N_SAMPLES < len(tags):
-            tags = rng.sample(tags, N_SAMPLES)
-            print(f"  Sampling {N_SAMPLES} frames (seed={RANDOM_SEED}).")
-        all_frames = [first_frames]
-        for folder, name in zip(folders[1:], exp_names[1:]):
-            frames = _load_frames_for_tags(folder, tags)
+    # ── Tag selection ─────────────────────────────────────────────────────────
+    tags = None
+    if CACHE_SAMPLED_TAGS and cache_file.is_file():
+        print(f"\n[{benchmark}] Loading cached tags from {cache_file}…")
+        with open(cache_file, "r") as f:
+            tags = [line.strip() for line in f if line.strip()]
+        print(f"  {len(tags)} tags loaded from cache.")
+        all_frames = []
+        for folder, name, source in zip(folders, exp_names, exp_sources):
+            frames = _load_frames_for_tags(folder, tags, source)
             print(f"  {name}: loaded {len(frames)} tags (targeted)")
             all_frames.append(frames)
     else:
-        print(f"\n[{benchmark}] Scanning all experiment folders...")
-        all_frames = []
-        for folder, name in zip(folders, exp_names):
-            frames = discover_frames(folder)
-            print(f"  {name}: {len(frames)} frame tags found")
-            all_frames.append(frames)
-        common_tags = set(all_frames[0].keys())
-        for frames in all_frames[1:]:
-            common_tags &= set(frames.keys())
-        if not common_tags:
-            print(f"  WARNING: no common frame tags found for benchmark '{benchmark}', skipping.")
+        print(f"\n[{benchmark}] Random sampling from first experiment (no cross-experiment check)…")
+        tags = _sample_tags(folders[0], exp_sources[0], N_SAMPLES, rng)
+
+        if not tags:
+            print(f"  WARNING: no samples found for benchmark '{benchmark}', skipping.")
             return
-        print(f"  {len(common_tags)} common frame tags found.")
-        tags = sorted(common_tags)
-        if N_SAMPLES is not None and N_SAMPLES < len(tags):
-            tags = rng.sample(tags, N_SAMPLES)
-            print(f"  Sampling {N_SAMPLES} frames (seed={RANDOM_SEED}).")
 
-    output_dir = Path(OUTPUT_DIR) / benchmark
-    output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  {len(tags)} tags sampled.")
 
-    for tag in tqdm(tags, desc=f"{benchmark}"):
-        per_exp = [frames[tag] for frames in all_frames]
-        out_path = output_dir / f"{tag}_comparison.png"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        make_comparison(tag, per_exp, exp_names, out_path)
+        if CACHE_SAMPLED_TAGS:
+            with open(cache_file, "w") as f:
+                for t in tags:
+                    f.write(t + "\n")
+            print(f"  Saved {len(tags)} tags to {cache_file}.")
 
-    print(f"  {len(tags)} files saved to: {output_dir.resolve()}")
+        all_frames = []
+        for folder, name, source in zip(folders, exp_names, exp_sources):
+            frames = _load_frames_for_tags(folder, tags, source)
+            print(f"  {name}: loaded {len(frames)} tags (targeted)")
+            all_frames.append(frames)
+
+    # ── Plot generation ───────────────────────────────────────────────────────
+#    for tag in tqdm(tags, desc=f"{benchmark}"):
+ #       per_exp = [frames.get(tag, {}) for frames in all_frames]
+  #      out_path = output_dir / f"{tag}_comparison.png"
+   #     out_path.parent.mkdir(parents=True, exist_ok=True)
+    #    make_comparison(tag, per_exp, exp_names, out_path)
+
+    #print(f"  {len(tags)} comparison plot(s) saved to: {output_dir.resolve()}")
+
+    # ── ZIP export ────────────────────────────────────────────────────────────
+    _create_samples_zip(benchmark, tags, folders, EXPERIMENTS, exp_names)
 
 
 def main():
@@ -423,8 +678,12 @@ def main():
     if len(exp_names) != len(EXPERIMENTS):
         raise ValueError("EXPERIMENT_NAMES length must match EXPERIMENTS length")
 
+    exp_sources = EXPERIMENT_SUBFOLDERS if "EXPERIMENT_SUBFOLDERS" in globals() else [""] * len(EXPERIMENTS)
+    if len(exp_sources) != len(EXPERIMENTS):
+        raise ValueError("EXPERIMENT_SUBFOLDERS length must match EXPERIMENTS length")
+
     for benchmark in BENCHMARKS:
-        run_benchmark(benchmark, exp_names)
+        run_benchmark(benchmark, exp_names, exp_sources)
 
     print("\nAll benchmarks done.")
 

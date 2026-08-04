@@ -57,7 +57,7 @@ Some packages must be built from source because the PyPI wheels are incomplete o
 The standard `pycocotools` PyPI package is missing some APIs. Clone and build from the ppwwyyxx fork instead:
 
 ```bash
-git clone https://github.com/ppwwyyxx/cocoapi.git
+git clone https://github.com/youtubevos/cocoapi.git
 cd cocoapi/PythonAPI
 python setup.py build_ext install
 cd ../..

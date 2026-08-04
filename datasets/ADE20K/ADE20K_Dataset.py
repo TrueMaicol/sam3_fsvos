@@ -58,12 +58,14 @@ class ADE20K_Dataset(Dataset):
         if self.use_grouping:
             self.idx_to_classname = {}
             self.class_idx_to_all_lemmas = {}
+            self.idx_to_ground_truth_label = {}
             for new_id in self.class_ids:
                 if str(new_id) in self.grouping_data:
                     metadata = self.grouping_data[str(new_id)]
                     if self.use_synset_names:
                         self.idx_to_classname[new_id] = metadata['selected_lemma'].replace("_", " ")
                         self.class_idx_to_all_lemmas[new_id] = [l.strip().replace("_", " ") for l in metadata['lemmas'].split(",")]
+                        self.idx_to_ground_truth_label[new_id] = ", ".join([l.replace("_", " ") for l in metadata['labels']])
                     else:
                         # Use native labels from JSON instead of synset lemmas
                         self.idx_to_classname[new_id] = metadata['labels'][0].replace("_", " ")
@@ -76,12 +78,14 @@ class ADE20K_Dataset(Dataset):
             synset_mapping = pd.read_csv(self.synset_mapping_csv_path, sep="|")
             self.idx_to_classname = {}
             self.class_idx_to_all_lemmas = {}
+            self.idx_to_ground_truth_label = {}
             for idx in self.class_ids:
                 match = synset_mapping[synset_mapping['idx'] == idx]
                 selected_lemma = match['selected_lemma']
                 
                 if len(selected_lemma) > 0 and pd.notna(selected_lemma.values[0]):
                     self.idx_to_classname[idx] = str(selected_lemma.values[0]).split(",")[0].replace("_", " ")
+                    self.idx_to_ground_truth_label[idx] = self.index['objectnames'][idx-1]  # full comma-separated synonyms
                 else:
                     raise ValueError("No match found for {}".format(idx))
                 
@@ -89,11 +93,18 @@ class ADE20K_Dataset(Dataset):
                 if pd.notna(lemmas_str):
                     self.class_idx_to_all_lemmas[idx] = [l.replace("_", " ") for l in lemmas_str.split(",")] 
         else:
+            # Plain mode: use the first ADE20K object name as both the class label and the
+            # single lemma. class_idx_to_all_lemmas must always be populated so that the
+            # test script's all_lemmas loop never hits a KeyError (mirrors coco-20i pattern).
             self.idx_to_classname = {idx: self.index['objectnames'][idx-1].split(",")[0] for idx in self.class_ids} # idx-1 to go back to 0-index
-        
-        # if we are using all the lemmas we shall have a number of classes that equal to the total number of lemmas
-        if all_lemmas:
-            self.class_ids = list(set([int(lemma["global_idx"]) for class_idx, lemma in class_idx_to_lemmas.items()]))
+            self.class_idx_to_all_lemmas = {idx: [self.idx_to_classname[idx]] for idx in self.class_ids}
+
+        # NOTE: the old `if all_lemmas:` block that tried to re-derive class_ids from a
+        # variable `class_idx_to_lemmas` has been removed.  That variable never existed in
+        # this scope (it was a leftover from an earlier refactor) and the block was therefore
+        # a NameError waiting to happen.  class_ids is already correctly set by
+        # construct_dataset() above, and class_idx_to_all_lemmas is now always populated
+        # regardless of the all_lemmas flag (the flag is handled by the test script, not here).
 
         
     def load_index(self):
@@ -151,6 +162,9 @@ class ADE20K_Dataset(Dataset):
                 if cat_id not in self.img_per_cat:
                     self.img_per_cat[cat_id] = 0
                 self.img_per_cat[cat_id] += 1
+
+        # Sort by (cat_id, img_idx) for a fully deterministic, seed-independent iteration order.
+        self.img_ids = sorted(self.img_ids, key=lambda x: (x[0], x[1]))
 
     def __len__(self):
         return len(self.img_ids)

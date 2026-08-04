@@ -31,11 +31,13 @@ class PASCAL5i_Dataset(Dataset):
         # Build idx_to_classname (Standardized 0-19 mapping)
         self.idx_to_classname = {}
         self.class_idx_to_all_lemmas = {}
-        
+        self.idx_to_ground_truth_label = {}
+
         if self.use_synset_names and synset_mapping_csv_path:
             synset_mapping = pd.read_csv(synset_mapping_csv_path, sep="|")
             for idx, name in enumerate(self.all_cats):
-                match = synset_mapping[synset_mapping['idx'] == idx]
+                csv_idx = idx + 1  # pascal.csv uses 1-based idx (1..20)
+                match = synset_mapping[synset_mapping['idx'] == csv_idx]
                 if not match.empty:
                     selected_lemma = match['selected_lemma'].values[0]
                     if pd.notna(selected_lemma):
@@ -46,6 +48,7 @@ class PASCAL5i_Dataset(Dataset):
                         self.class_idx_to_all_lemmas[idx] = [l.replace("_", " ") for l in str(lemmas_str).split(",")]
                 else:
                     self.idx_to_classname[idx] = name
+                self.idx_to_ground_truth_label[idx] = name
         else:
             for idx, name in enumerate(self.all_cats):
                 self.idx_to_classname[idx] = name
@@ -64,7 +67,11 @@ class PASCAL5i_Dataset(Dataset):
 
         if self.transform is not None:
             query_img, query_mask = self.transform([query_img], [query_mask])
-            support_imgs, support_masks = self.transform(support_imgs, support_masks)
+            if self.shot > 0:
+                support_imgs, support_masks = self.transform(support_imgs, support_masks)
+            else:
+                support_imgs = torch.tensor([])
+                support_masks = torch.tensor([])
             
         return query_img, query_mask, support_imgs, support_masks, int(class_idx), query_name
 
